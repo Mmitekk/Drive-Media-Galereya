@@ -376,20 +376,54 @@ async function handleFolders(
     return json({ error: "Требуется авторизация" }, 401);
   }
 
-  const data = await driveFetch(
-    "/files",
-    {
-      q: `'${env.DRIVE_ROOT_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-      fields: "files(id, name, createdTime, parents)",
-      pageSize: "200",
-      orderBy: "name",
-      supportsAllDrives: "true",
-      includeItemsFromAllDrives: "true",
-    },
-    env.DRIVE_API_KEY
-  );
+  // ── BFS: recursively discover ALL subfolders (not just top-level) ──
+  // The old code only fetched direct children of the root folder.
+  // This missed nested subfolders like "Видео / Как Шерон Стоун / Красотка в белом".
+  // Now we walk the entire folder tree level by level.
+  const allFolders: Record<string, unknown>[] = [];
+  let currentLevel = [env.DRIVE_ROOT_FOLDER_ID];
+  const visited = new Set<string>([env.DRIVE_ROOT_FOLDER_ID]);
+  const MAX_DEPTH = 10;   // Safety: don't go deeper than 10 levels
+  const MAX_FOLDERS = 500; // Safety: don't discover more than 500 folders
+  const CHUNK_SIZE = 25;   // Max parent IDs per Drive API query (avoid URL length limits)
 
-  let folders = (data.files as Record<string, unknown>[]) || [];
+  for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
+    const nextLevel: string[] = [];
+
+    // Process current level in chunks to avoid Drive API query length limits
+    for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
+      const chunk = currentLevel.slice(i, i + CHUNK_SIZE);
+      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+      const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+
+      const data = await driveFetch(
+        "/files",
+        {
+          q: query,
+          fields: "files(id, name, createdTime, parents)",
+          pageSize: "500",
+          orderBy: "name",
+          supportsAllDrives: "true",
+          includeItemsFromAllDrives: "true",
+        },
+        env.DRIVE_API_KEY
+      );
+
+      const folders = (data.files as Record<string, unknown>[]) || [];
+      for (const folder of folders) {
+        const id = folder.id as string;
+        if (!visited.has(id)) {
+          visited.add(id);
+          allFolders.push(folder);
+          nextLevel.push(id);
+        }
+      }
+    }
+
+    currentLevel = nextLevel;
+  }
+
+  let folders = allFolders;
 
   // Фильтрация папок на сервере! Гость не видит admin-папки.
   if (auth.role === "guest" && (auth.adminFolders as string[])?.length > 0) {
@@ -466,35 +500,40 @@ async function handleBatchFiles(
     return json({ files: {} });
   }
 
-  // Build a single Drive API query using OR conditions
-  // This uses only ONE subrequest instead of N separate requests
-  const parentQueries = allowedFolderIds.map((id) => `'${id}' in parents`).join(" or ");
-  const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
-
-  const data = await driveFetch(
-    "/files",
-    {
-      q: query,
-      fields:
-        "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
-      pageSize: "1000",
-      orderBy: "createdTime desc",
-      supportsAllDrives: "true",
-      includeItemsFromAllDrives: "true",
-    },
-    env.DRIVE_API_KEY
-  );
-
-  // Group files by their parent folder
+  // ── Chunked batch: split folder IDs into chunks to avoid Drive API query length limits ──
+  // With nested subfolders, the list of IDs can be very long (50+).
+  // Each `'ID' in parents` clause is ~35 chars, so ~25 IDs per query is safe.
+  const BATCH_CHUNK_SIZE = 25;
   const filesByFolder: Record<string, Record<string, unknown>[]> = {};
-  const rawFiles = (data.files as Record<string, unknown>[]) || [];
 
-  for (const file of rawFiles) {
-    const parents = (file.parents as string[]) || [];
-    for (const parentId of parents) {
-      if (allowedFolderIds.includes(parentId)) {
-        if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
-        filesByFolder[parentId].push(file);
+  for (let i = 0; i < allowedFolderIds.length; i += BATCH_CHUNK_SIZE) {
+    const chunk = allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE);
+    const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+    const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
+
+    const data = await driveFetch(
+      "/files",
+      {
+        q: query,
+        fields:
+          "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+        pageSize: "1000",
+        orderBy: "createdTime desc",
+        supportsAllDrives: "true",
+        includeItemsFromAllDrives: "true",
+      },
+      env.DRIVE_API_KEY
+    );
+
+    // Group files by their parent folder
+    const rawFiles = (data.files as Record<string, unknown>[]) || [];
+    for (const file of rawFiles) {
+      const parents = (file.parents as string[]) || [];
+      for (const parentId of parents) {
+        if (allowedFolderIds.includes(parentId)) {
+          if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
+          filesByFolder[parentId].push(file);
+        }
       }
     }
   }

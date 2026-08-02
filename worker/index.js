@@ -1,72 +1,28 @@
-// ============================================================
-// DMGA Cloudflare Worker — Google Drive Media Gallery API
-// ============================================================
-// Endpoints:
-//   POST /auth/admin          — admin login by password
-//   POST /auth/guest          — guest login by key-file + password
-//   GET  /folders             — list folders (filtered by role)
-//   GET  /files/:folderId     — list files in folder
-//   GET  /files/root          — list files in root folder
-//   POST /keyfile/generate    — generate guest key-file (admin only)
-//   GET  /media/:fileId       — stream video/image through proxy
-//   GET  /thumbnail/:fileId   — proxy thumbnail image (small, fast)
-// ============================================================
-
-const DRIVE_API = "https://www.googleapis.com/drive/v3";
-
-// ── CORS helpers ──────────────────────────────────────────────
-
-const CORS_HEADERS = {
+// index.ts
+var CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  "Access-Control-Max-Age": "86400",
+  "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
+  "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-DMGA-Status"
 };
-
-function corsResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(body, {
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
     status,
-    headers: { ...CORS_HEADERS, "Content-Type": "application/json", ...extraHeaders },
+    headers: { ...CORS_HEADERS, "Content-Type": "application/json" }
   });
 }
-
-// ── JWT helpers (HMAC-SHA256) ─────────────────────────────────
-
-async function signJWT(payload, secret) {
-  const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = b64url(JSON.stringify(payload));
-  const sig = await hmacSign(`${header}.${body}`, secret);
-  return `${header}.${body}.${sig}`;
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-
-async function verifyJWT(token, secret) {
-  try {
-    if (!secret) return null;
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const [header, body, sig] = parts;
-    const expected = await hmacSign(`${header}.${body}`, secret);
-    if (sig !== expected) return null;
-    const payload = JSON.parse(b64urlDecode(body));
-    if (payload.exp && payload.exp < Date.now() / 1000) return null;
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
-function b64url(str) {
-  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
 function b64urlDecode(str) {
-  str = str.replace(/-/g, "+").replace(/_/g, "/");
-  while (str.length % 4) str += "=";
-  return atob(str);
+  return atob(str.replace(/-/g, "+").replace(/_/g, "/"));
 }
-
-async function hmacSign(data, secret) {
-  if (!secret) throw new Error("TOKEN_SECRET not configured");
+async function createJWT(payload, secret) {
+  const header = b64url(
+    new TextEncoder().encode(JSON.stringify({ alg: "HS256", typ: "JWT" }))
+  );
+  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const msg = `${header}.${body}`;
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -74,17 +30,42 @@ async function hmacSign(data, secret) {
     false,
     ["sign"]
   );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
-  return btoa(String.fromCharCode(...new Uint8Array(sig)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  const sig = b64url(
+    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg))
+  );
+  return `${msg}.${sig}`;
 }
-
-// ── AES-256-GCM encryption for key-files ──────────────────────
-
+async function verifyJWT(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [h, b, s] = parts;
+  const msg = `${h}.${b}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  const sigStr = b64urlDecode(s);
+  const sigBuf = new Uint8Array(sigStr.length);
+  for (let i = 0; i < sigStr.length; i++) sigBuf[i] = sigStr.charCodeAt(i);
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    sigBuf,
+    new TextEncoder().encode(msg)
+  );
+  if (!valid) return null;
+  const payload = JSON.parse(b64urlDecode(b));
+  if (payload.exp && payload.exp < Date.now() / 1e3) return null;
+  return payload;
+}
+var PBKDF2_ITERATIONS = 1e5;
+var SALT_LENGTH = 16;
+var IV_LENGTH = 12;
 async function deriveKey(password, salt) {
-  const keyMaterial = await crypto.subtle.importKey(
+  const km = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(password),
     "PBKDF2",
@@ -92,568 +73,512 @@ async function deriveKey(password, salt) {
     ["deriveKey"]
   );
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
-    keyMaterial,
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: "SHA-256"
+    },
+    km,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"]
   );
 }
-
-async function encrypt(plaintext, password) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+async function encrypt(data, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
   const key = await deriveKey(password, salt);
-  const encrypted = await crypto.subtle.encrypt(
+  const ct = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     key,
-    new TextEncoder().encode(plaintext)
+    new TextEncoder().encode(JSON.stringify(data))
   );
-  // Format: version(1) + salt(16) + iv(12) + ciphertext
-  const result = new Uint8Array(1 + 16 + 12 + encrypted.byteLength);
-  result[0] = 4; // version
-  result.set(salt, 1);
-  result.set(iv, 17);
-  result.set(new Uint8Array(encrypted), 29);
-  return btoa(String.fromCharCode(...result));
+  const combined = new Uint8Array(salt.length + iv.length + ct.byteLength);
+  combined.set(salt, 0);
+  combined.set(iv, salt.length);
+  combined.set(new Uint8Array(ct), salt.length + iv.length);
+  return btoa(String.fromCharCode(...combined));
 }
-
-async function decrypt(encoded, password) {
-  const data = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
-  if (data[0] !== 4) throw new Error("Unsupported key-file version");
-  const salt = data.slice(1, 17);
-  const iv = data.slice(17, 29);
-  const ciphertext = data.slice(29);
+async function decrypt(base64, password) {
+  const combined = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  if (combined.length < SALT_LENGTH + IV_LENGTH + 1)
+    throw new Error("\u041F\u043E\u0432\u0440\u0435\u0436\u0434\u0451\u043D\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043A\u043B\u044E\u0447\u0430");
+  const salt = combined.slice(0, SALT_LENGTH);
+  const iv = combined.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
+  const ct = combined.slice(SALT_LENGTH + IV_LENGTH);
   const key = await deriveKey(password, salt);
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    ciphertext
-  );
-  return new TextDecoder().decode(decrypted);
-}
-
-// ── Google Drive API helpers ──────────────────────────────────
-
-async function driveGet(path, apiKey) {
-  const url = new URL(`${DRIVE_API}${path}`);
-  url.searchParams.set("key", apiKey);
-  const res = await fetch(url.toString());
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message || `Drive API error ${res.status}`);
-  }
-  return res.json();
-}
-
-async function driveListFiles(query, apiKey, fields, pageSize = 200, orderBy = "name") {
-  const url = new URL(`${DRIVE_API}/files`);
-  url.searchParams.set("key", apiKey);
-  url.searchParams.set("q", query);
-  url.searchParams.set("fields", fields);
-  url.searchParams.set("pageSize", String(pageSize));
-  url.searchParams.set("orderBy", orderBy);
-  url.searchParams.set("supportsAllDrives", "true");
-  url.searchParams.set("includeItemsFromAllDrives", "true");
-  const res = await fetch(url.toString());
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message || `Drive API error ${res.status}`);
-  }
-  return res.json();
-}
-
-// ── Auth middleware ────────────────────────────────────────────
-
-function getBearerToken(request) {
-  const auth = request.headers.get("Authorization");
-  if (auth?.startsWith("Bearer ")) return auth.slice(7);
-  return null;
-}
-
-async function requireAuth(request, jwtSecret) {
-  const token = getBearerToken(request);
-  if (!token) throw new Error("Требуется авторизация");
-  const payload = await verifyJWT(token, jwtSecret);
-  if (!payload) throw new Error("Недействительный токен");
-  return payload;
-}
-
-// ── Route handlers ────────────────────────────────────────────
-
-async function handleAdminLogin(request, env) {
-  const { password } = await request.json();
-  if (!password) throw new Error("Введите пароль");
-
-  if (password !== env.ADMIN_PASSWORD) {
-    throw new Error("Неверный пароль");
-  }
-
-  const payload = {
-    role: "admin",
-    adminFolders: [],
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 7 * 24 * 3600, // 7 days
-  };
-
-  const token = await signJWT(payload, env.TOKEN_SECRET);
-  return corsResponse(JSON.stringify({ token, role: "admin", adminFolders: [] }));
-}
-
-async function handleGuestLogin(request, env) {
-  const { keyFile, password } = await request.json();
-  if (!keyFile) throw new Error("Загрузите ключ-файл");
-  if (!password) throw new Error("Введите пароль");
-
-  let payload;
+  let pt;
   try {
-    const decrypted = await decrypt(keyFile, password);
-    payload = JSON.parse(decrypted);
+    pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
   } catch {
-    throw new Error("Неверный пароль или повреждённый ключ-файл");
+    throw new Error("\u041D\u0435\u0432\u0435\u0440\u043D\u044B\u0439 \u043F\u0430\u0440\u043E\u043B\u044C \u0438\u043B\u0438 \u043F\u043E\u0432\u0440\u0435\u0436\u0434\u0451\u043D\u043D\u044B\u0439 \u0444\u0430\u0439\u043B");
   }
-
-  if (payload.version !== 4) throw new Error("Неподдерживаемая версия ключ-файла");
-
-  const jwtPayload = {
-    role: "guest",
-    adminFolders: payload.adminFolders || [],
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
-  };
-
-  const token = await signJWT(jwtPayload, env.TOKEN_SECRET);
-  return corsResponse(
-    JSON.stringify({ token, role: "guest", adminFolders: payload.adminFolders || [] })
-  );
+  return JSON.parse(new TextDecoder().decode(pt));
 }
-
-async function handleGetFolders(request, env) {
-  const user = await requireAuth(request, env.TOKEN_SECRET);
-  const rootId = env.GOOGLE_DRIVE_ROOT_FOLDER_ID;
-  const apiKey = env.GOOGLE_DRIVE_API_KEY;
-
-  // Recursively fetch ALL folders under root (not just direct children)
-  const allFolders = [];
-  const queue = [rootId]; // BFS: start from root
-  const visited = new Set();
-
-  while (queue.length > 0) {
-    const parentId = queue.shift();
-    if (visited.has(parentId)) continue;
-    visited.add(parentId);
-
-    const query = `'${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-    const data = await driveListFiles(
-      query,
-      apiKey,
-      "nextPageToken, files(id, name, createdTime, parents)",
-      500,
-      "name"
+async function generateToken(role, adminFolders, salt) {
+  const data = `${role}:${adminFolders.sort().join(",")}:${salt}`;
+  const buf = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(data)
+  );
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function driveFetch(path, params, apiKey) {
+  const url = new URL(`https://www.googleapis.com/drive/v3${path}`);
+  url.searchParams.set("key", apiKey);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(
+      body?.error ? String(body.error?.message || `Drive API error ${res.status}`) : `Drive API error ${res.status}`
     );
-
-    const children = data.files || [];
-    for (const folder of children) {
-      allFolders.push(folder);
-      queue.push(folder.id); // Search inside this folder too
-    }
   }
-
-  // Filter folders based on role
-  let folders = allFolders;
-  if (user.role === "guest" && user.adminFolders?.length > 0) {
-    // Guest can see everything EXCEPT admin-only folders AND their subfolders
-    const blocked = new Set(user.adminFolders);
-    // Also block any folder whose ancestor is blocked
-    folders = allFolders.filter((f) => {
-      const parentArr = f.parents || [];
-      // Block if this folder itself or any parent in its chain is blocked
-      if (blocked.has(f.id)) return false;
-      // Check if any ancestor is blocked (walk up the tree)
-      let checkId = parentArr[0];
-      const seen = new Set();
-      while (checkId && !seen.has(checkId)) {
-        seen.add(checkId);
-        if (blocked.has(checkId)) return false;
-        const parent = allFolders.find((ff) => ff.id === checkId);
-        checkId = parent?.parents?.[0];
-      }
-      return true;
-    });
-  }
-
-  return corsResponse(JSON.stringify({ folders }));
+  return res.json();
 }
-
-async function handleGetFiles(folderId, request, env) {
-  const user = await requireAuth(request, env.TOKEN_SECRET);
-
-  // Check access
-  if (user.role === "guest" && user.adminFolders?.includes(folderId)) {
-    throw new Error("Доступ запрещён");
+async function getAuth(request, env) {
+  const auth = request.headers.get("Authorization");
+  if (!auth?.startsWith("Bearer ")) return null;
+  return verifyJWT(auth.slice(7), env.JWT_SECRET);
+}
+async function handleAdminAuth(request, env) {
+  const body = await request.json();
+  const { password } = body;
+  if (!password || password !== env.ADMIN_PASSWORD) {
+    return json({ error: "\u041D\u0435\u0432\u0435\u0440\u043D\u044B\u0439 \u043F\u0430\u0440\u043E\u043B\u044C" }, 401);
   }
-
-  const query = `'${folderId}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
-  const data = await driveListFiles(
-    query,
-    env.GOOGLE_DRIVE_API_KEY,
-    "nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
-    200,
-    "createdTime desc"
+  const now = Math.floor(Date.now() / 1e3);
+  const jwt = await createJWT(
+    {
+      role: "admin",
+      adminFolders: [],
+      iat: now,
+      exp: now + 7 * 24 * 3600
+      // 7 дней
+    },
+    env.JWT_SECRET
   );
-
-  return corsResponse(JSON.stringify({ files: data.files || [] }));
+  return json({ token: jwt, role: "admin" });
 }
-
-async function handleGetRootFiles(request, env) {
-  return handleGetFiles(env.GOOGLE_DRIVE_ROOT_FOLDER_ID, request, env);
+async function handleGuestAuth(request, env) {
+  const body = await request.json();
+  const { keyFile, password } = body;
+  if (!keyFile || !password) {
+    return json({ error: "\u041D\u0435 \u0443\u043A\u0430\u0437\u0430\u043D \u043A\u043B\u044E\u0447-\u0444\u0430\u0439\u043B \u0438\u043B\u0438 \u043F\u0430\u0440\u043E\u043B\u044C" }, 400);
+  }
+  let kf;
+  try {
+    kf = await decrypt(keyFile, password);
+  } catch (e) {
+    return json(
+      { error: e instanceof Error ? e.message : "\u041E\u0448\u0438\u0431\u043A\u0430 \u0440\u0430\u0441\u0448\u0438\u0444\u0440\u043E\u0432\u043A\u0438" },
+      401
+    );
+  }
+  if (kf.v !== 4) {
+    return json({ error: "\u041D\u0435\u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u043C\u0430\u044F \u0432\u0435\u0440\u0441\u0438\u044F \u043A\u043B\u044E\u0447-\u0444\u0430\u0439\u043B\u0430" }, 400);
+  }
+  const expectedToken = await generateToken(
+    String(kf.role),
+    kf.adminFolders || [],
+    env.TOKEN_SALT
+  );
+  if (kf.token !== expectedToken) {
+    return json({ error: "\u041A\u043B\u044E\u0447-\u0444\u0430\u0439\u043B \u043F\u043E\u0432\u0440\u0435\u0436\u0434\u0451\u043D \u0438\u043B\u0438 \u0431\u044B\u043B \u0438\u0437\u043C\u0435\u043D\u0451\u043D" }, 401);
+  }
+  if (kf.role !== "guest") {
+    return json({ error: "\u042D\u0442\u043E \u043D\u0435 \u0433\u043E\u0441\u0442\u0435\u0432\u043E\u0439 \u043A\u043B\u044E\u0447-\u0444\u0430\u0439\u043B" }, 400);
+  }
+  const now = Math.floor(Date.now() / 1e3);
+  const adminFolders = kf.adminFolders || [];
+  const jwt = await createJWT(
+    {
+      role: "guest",
+      adminFolders,
+      iat: now,
+      exp: now + 30 * 24 * 3600
+      // 30 дней
+    },
+    env.JWT_SECRET
+  );
+  return json({ token: jwt, role: "guest", adminFolders });
 }
-
-async function handleGenerateKeyFile(request, env) {
-  const user = await requireAuth(request, env.TOKEN_SECRET);
-  if (user.role !== "admin") throw new Error("Только для администратора");
-
-  const { password, adminFolders } = await request.json();
-  if (!password || password.length < 4) throw new Error("Пароль минимум 4 символа");
-  if (!adminFolders || !Array.isArray(adminFolders)) {
-    throw new Error("Укажите список папок");
+async function handleKeyFileGenerate(request, env) {
+  const auth = await getAuth(request, env);
+  if (!auth || auth.role !== "admin") {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0430" }, 403);
   }
-
-  const payload = JSON.stringify({
-    version: 4,
-    adminFolders,
-    created: new Date().toISOString(),
-  });
-
-  const encrypted = await encrypt(payload, password);
-
-  return corsResponse(JSON.stringify({ keyFile: encrypted }));
+  const body = await request.json();
+  const { password, adminFolders } = body;
+  if (!password || password.length < 4) {
+    return json(
+      { error: "\u041F\u0430\u0440\u043E\u043B\u044C \u0434\u043E\u043B\u0436\u0435\u043D \u0431\u044B\u0442\u044C \u043D\u0435 \u043C\u0435\u043D\u0435\u0435 4 \u0441\u0438\u043C\u0432\u043E\u043B\u043E\u0432" },
+      400
+    );
+  }
+  const token = await generateToken(
+    "guest",
+    adminFolders || [],
+    env.TOKEN_SALT
+  );
+  const keyFileData = {
+    v: 4,
+    role: "guest",
+    adminFolders: adminFolders || [],
+    token
+  };
+  const encrypted = await encrypt(keyFileData, password);
+  return json({ keyFile: encrypted });
 }
-
-// ── Media streaming proxy ─────────────────────────────────────
-
-async function handleMediaProxy(fileId, request, env) {
-  // Validate token from query param (for <video> / <img> src)
-  const url = new URL(request.url);
-  const token = url.searchParams.get("token");
-  if (!token) {
-    return corsResponse(JSON.stringify({ error: "Требуется авторизация" }), 401);
+async function handleFolders(request, env) {
+  const auth = await getAuth(request, env);
+  if (!auth) {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
   }
-
-  const user = await verifyJWT(token, env.TOKEN_SECRET);
-  if (!user) {
-    return corsResponse(JSON.stringify({ error: "Недействительный токен" }), 401);
-  }
-
-  // Check folder-level access
-  if (user.role === "guest" && user.adminFolders?.length > 0) {
-    // Need to check the file's parent folder
-    try {
-      const fileInfo = await driveGet(`/files/${fileId}?fields=parents&supportsAllDrives=true&includeItemsFromAllDrives=true`, env.GOOGLE_DRIVE_API_KEY);
-      const parentIds = fileInfo.parents || [];
-      if (parentIds.some((pid) => user.adminFolders.includes(pid))) {
-        return corsResponse(JSON.stringify({ error: "Доступ запрещён" }), 403);
+  const allFolders = [];
+  let currentLevel = [env.DRIVE_ROOT_FOLDER_ID];
+  const visited = /* @__PURE__ */ new Set([env.DRIVE_ROOT_FOLDER_ID]);
+  const MAX_DEPTH = 10;
+  const MAX_FOLDERS = 500;
+  const CHUNK_SIZE = 25;
+  for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
+    const nextLevel = [];
+    for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
+      const chunk = currentLevel.slice(i, i + CHUNK_SIZE);
+      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+      const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+      const data = await driveFetch(
+        "/files",
+        {
+          q: query,
+          fields: "files(id, name, createdTime, parents)",
+          pageSize: "500",
+          orderBy: "name",
+          supportsAllDrives: "true",
+          includeItemsFromAllDrives: "true"
+        },
+        env.DRIVE_API_KEY
+      );
+      const folders2 = data.files || [];
+      for (const folder of folders2) {
+        const id = folder.id;
+        if (!visited.has(id)) {
+          visited.add(id);
+          allFolders.push(folder);
+          nextLevel.push(id);
+        }
       }
-    } catch {
-      // If we can't check, allow through (file might not exist)
+    }
+    currentLevel = nextLevel;
+  }
+  let folders = allFolders;
+  if (auth.role === "guest" && auth.adminFolders?.length > 0) {
+    const adminFolders = auth.adminFolders;
+    folders = folders.filter((f) => !adminFolders.includes(f.id));
+  }
+  return json({ folders });
+}
+async function handleFiles(request, env, folderId) {
+  const auth = await getAuth(request, env);
+  if (!auth) {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
+  }
+  if (auth.role === "guest" && auth.adminFolders?.includes(folderId)) {
+    return json({ error: "\u0414\u043E\u0441\u0442\u0443\u043F \u0437\u0430\u043F\u0440\u0435\u0449\u0451\u043D" }, 403);
+  }
+  const data = await driveFetch(
+    "/files",
+    {
+      q: `'${folderId}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`,
+      fields: "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+      pageSize: "200",
+      orderBy: "createdTime desc",
+      supportsAllDrives: "true",
+      includeItemsFromAllDrives: "true"
+    },
+    env.DRIVE_API_KEY
+  );
+  return json({ files: data.files || [] });
+}
+async function handleBatchFiles(request, env) {
+  const auth = await getAuth(request, env);
+  if (!auth) {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
+  }
+  const url = new URL(request.url);
+  const idsParam = url.searchParams.get("ids");
+  if (!idsParam) {
+    return json({ error: "\u041D\u0435 \u0443\u043A\u0430\u0437\u0430\u043D\u044B ID \u043F\u0430\u043F\u043E\u043A (\u043F\u0430\u0440\u0430\u043C\u0435\u0442\u0440 ids)" }, 400);
+  }
+  const folderIds = idsParam.split(",").filter(Boolean);
+  if (folderIds.length === 0) {
+    return json({ error: "\u041F\u0443\u0441\u0442\u043E\u0439 \u0441\u043F\u0438\u0441\u043E\u043A ID \u043F\u0430\u043F\u043E\u043A" }, 400);
+  }
+  const adminFolders = auth.adminFolders || [];
+  const allowedFolderIds = auth.role === "guest" && adminFolders.length > 0 ? folderIds.filter((id) => !adminFolders.includes(id)) : folderIds;
+  if (allowedFolderIds.length === 0) {
+    return json({ files: {} });
+  }
+  const BATCH_CHUNK_SIZE = 25;
+  const filesByFolder = {};
+  for (let i = 0; i < allowedFolderIds.length; i += BATCH_CHUNK_SIZE) {
+    const chunk = allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE);
+    const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+    const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
+    const data = await driveFetch(
+      "/files",
+      {
+        q: query,
+        fields: "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+        pageSize: "1000",
+        orderBy: "createdTime desc",
+        supportsAllDrives: "true",
+        includeItemsFromAllDrives: "true"
+      },
+      env.DRIVE_API_KEY
+    );
+    const rawFiles = data.files || [];
+    for (const file of rawFiles) {
+      const parents = file.parents || [];
+      for (const parentId of parents) {
+        if (allowedFolderIds.includes(parentId)) {
+          if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
+          filesByFolder[parentId].push(file);
+        }
+      }
     }
   }
-
-  // ── HEAD request: probe if file is accessible ──
-  // The client sends a HEAD request to check if the video URL works
-  // before setting it as <video src>. This prevents the native
-  // browser error overlay from appearing.
+  for (const folderId of allowedFolderIds) {
+    if (!filesByFolder[folderId]) {
+      filesByFolder[folderId] = [];
+    }
+  }
+  return json({ files: filesByFolder });
+}
+async function handleRootFiles(request, env) {
+  const auth = await getAuth(request, env);
+  if (!auth) {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
+  }
+  const data = await driveFetch(
+    "/files",
+    {
+      q: `'${env.DRIVE_ROOT_FOLDER_ID}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`,
+      fields: "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+      pageSize: "200",
+      orderBy: "createdTime desc",
+      supportsAllDrives: "true",
+      includeItemsFromAllDrives: "true"
+    },
+    env.DRIVE_API_KEY
+  );
+  return json({ files: data.files || [] });
+}
+async function handleMedia(request, env, fileId) {
+  let token = null;
+  const url = new URL(request.url);
+  if (url.searchParams.has("token")) {
+    token = url.searchParams.get("token");
+  } else {
+    const auth = await getAuth(request, env);
+    if (!auth) {
+      return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
+    }
+    token = request.headers.get("Authorization")?.slice(7) || null;
+  }
+  if (!token) {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
+  }
+  const payload = await verifyJWT(token, env.JWT_SECRET);
+  if (!payload) {
+    return json({ error: "\u041D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0439 \u0442\u043E\u043A\u0435\u043D" }, 401);
+  }
   if (request.method === "HEAD") {
-    // Make a small range request to Google Drive to check accessibility
-    const probeUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.GOOGLE_DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+    const probeUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
     try {
       const probeRes = await fetch(probeUrl, {
-        headers: { "Range": "bytes=0-1" }, // Just check first 2 bytes
+        headers: { "Range": "bytes=0-1" }
       });
       if (probeRes.ok || probeRes.status === 206) {
-        // File is accessible — return 200 with CORS headers
-        const contentType = probeRes.headers.get("Content-Type") || "application/octet-stream";
-        const contentLength = probeRes.headers.get("Content-Range")?.split("/")?.[1] || probeRes.headers.get("Content-Length") || "0";
+        const contentType2 = probeRes.headers.get("Content-Type") || "application/octet-stream";
+        const contentLength2 = probeRes.headers.get("Content-Range")?.split("/")?.[1] || probeRes.headers.get("Content-Length") || "0";
         return new Response(null, {
           status: 200,
           headers: {
             ...CORS_HEADERS,
-            "Content-Type": contentType,
-            "Content-Length": contentLength,
+            "Content-Type": contentType2,
+            "Content-Length": contentLength2,
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-cache",
-            "X-DMGA-Status": "accessible",
-          },
+            "X-DMGA-Status": "accessible"
+          }
         });
       } else {
-        // File not accessible — return the error status
         let errorMsg = `Drive API error ${probeRes.status}`;
         try {
           const errBody = await probeRes.json();
-          errorMsg = errBody?.error?.message || errorMsg;
-        } catch {}
-        return corsResponse(JSON.stringify({ error: errorMsg }), probeRes.status);
+          errorMsg = errBody?.error ? String(errBody.error?.message || errorMsg) : errorMsg;
+        } catch {
+        }
+        return json({ error: errorMsg }, probeRes.status);
       }
     } catch (err) {
-      return corsResponse(JSON.stringify({ error: `Network error: ${err.message}` }), 502);
+      return json({ error: `Network error: ${err instanceof Error ? err.message : "unknown"}` }, 502);
     }
   }
-
-  // ── GET request: stream the file ──
-
-  // Build Google Drive download URL (include shared drive support)
-  const driveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.GOOGLE_DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
-
-  // Forward Range header from client to Google Drive
   const driveHeaders = {};
   const rangeHeader = request.headers.get("Range");
   if (rangeHeader) {
     driveHeaders["Range"] = rangeHeader;
   }
-
-  // Stream the response from Google Drive
-  const driveResponse = await fetch(driveUrl, { headers: driveHeaders });
-
-  if (!driveResponse.ok) {
-    // Try to read error body
-    let errorMsg = `Drive API error ${driveResponse.status}`;
-    try {
-      const errBody = await driveResponse.json();
-      errorMsg = errBody?.error?.message || errorMsg;
-    } catch {}
-    // Return error with no-cache to prevent browser caching the error
-    return corsResponse(JSON.stringify({ error: errorMsg }), driveResponse.status, {
-      "Cache-Control": "no-cache",
-    });
+  const driveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+  const driveRes = await fetch(driveUrl, { headers: driveHeaders });
+  if (!driveRes.ok) {
+    const body = await driveRes.text().catch(() => "");
+    return json(
+      { error: `\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0444\u0430\u0439\u043B: ${driveRes.status}` },
+      driveRes.status
+    );
   }
-
-  // Build response headers — stream body directly (no buffering!)
-  const responseHeaders = {
+  const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
+  const contentLength = driveRes.headers.get("Content-Length");
+  const contentRange = driveRes.headers.get("Content-Range");
+  const acceptRanges = driveRes.headers.get("Accept-Ranges");
+  const headers = {
     ...CORS_HEADERS,
-    "Accept-Ranges": "bytes",
-    "Content-Type": driveResponse.headers.get("Content-Type") || "application/octet-stream",
-    // Don't cache Range requests (probe requests) — only cache full responses
-    // This prevents the browser from caching a 2-byte probe response
-    // and serving it to the <video> tag later
-    "Cache-Control": rangeHeader ? "no-cache, no-store" : "public, max-age=3600",
+    "Content-Type": contentType,
+    "Cache-Control": "public, max-age=3600",
+    // 1h cache
+    "Accept-Ranges": acceptRanges || "bytes"
   };
-
-  // Forward Content-Range and Content-Length for partial content
-  const contentRange = driveResponse.headers.get("Content-Range");
-  const contentLength = driveResponse.headers.get("Content-Length");
-  if (contentRange) {
-    responseHeaders["Content-Range"] = contentRange;
-  }
-  if (contentLength) {
-    responseHeaders["Content-Length"] = contentLength;
-  }
-
-  // Return streaming response — body is ReadableStream, not buffered
-  return new Response(driveResponse.body, {
-    status: driveResponse.status,
-    headers: responseHeaders,
+  if (contentLength) headers["Content-Length"] = contentLength;
+  if (contentRange) headers["Content-Range"] = contentRange;
+  const isPartial = driveRes.status === 206;
+  return new Response(driveRes.body, {
+    status: isPartial ? 206 : 200,
+    headers
   });
 }
-
-// ── Thumbnail proxy ──────────────────────────────────────────
-// Returns a small thumbnail image for a file. This is MUCH faster
-// than /media/ because it uses Google's pre-generated thumbnail
-// instead of streaming the entire file.
-// Used for gallery card thumbnails and Stories circle avatars.
-
-async function handleThumbnailProxy(fileId, request, env) {
-  // Validate token from query param
+async function handleThumbnail(request, env, fileId) {
+  let token = null;
   const url = new URL(request.url);
-  const token = url.searchParams.get("token");
-  if (!token) {
-    return corsResponse(JSON.stringify({ error: "Требуется авторизация" }), 401);
-  }
-
-  const user = await verifyJWT(token, env.TOKEN_SECRET);
-  if (!user) {
-    return corsResponse(JSON.stringify({ error: "Недействительный токен" }), 401);
-  }
-
-  // Check folder-level access for guests
-  if (user.role === "guest" && user.adminFolders?.length > 0) {
-    try {
-      const fileInfo = await driveGet(`/files/${fileId}?fields=parents&supportsAllDrives=true&includeItemsFromAllDrives=true`, env.GOOGLE_DRIVE_API_KEY);
-      const parentIds = fileInfo.parents || [];
-      if (parentIds.some((pid) => user.adminFolders.includes(pid))) {
-        return corsResponse(JSON.stringify({ error: "Доступ запрещён" }), 403);
-      }
-    } catch {
-      // If we can't check, allow through
+  if (url.searchParams.has("token")) {
+    token = url.searchParams.get("token");
+  } else {
+    const auth = await getAuth(request, env);
+    if (!auth) {
+      return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
     }
+    token = request.headers.get("Authorization")?.slice(7) || null;
   }
-
-  // Optional size parameter: ?sz=w400 (default w400)
-  const sz = url.searchParams.get("sz") || "w400";
-
-  // Strategy 1: Use Drive API to get thumbnailLink, then proxy it
+  if (!token) {
+    return json({ error: "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F" }, 401);
+  }
+  const payload = await verifyJWT(token, env.JWT_SECRET);
+  if (!payload) {
+    return json({ error: "\u041D\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0439 \u0442\u043E\u043A\u0435\u043D" }, 401);
+  }
+  const sizeParam = url.searchParams.get("sz") || "w400";
+  const size = parseInt(sizeParam.replace("w", ""), 10) || 400;
   try {
-    const fileInfo = await driveGet(
-      `/files/${fileId}?fields=thumbnailLink,mimeType&supportsAllDrives=true&includeItemsFromAllDrives=true`,
-      env.GOOGLE_DRIVE_API_KEY
+    const fileData = await driveFetch(
+      `/files/${fileId}`,
+      {
+        fields: "thumbnailLink,mimeType",
+        supportsAllDrives: "true",
+        includeItemsFromAllDrives: "true"
+      },
+      env.DRIVE_API_KEY
     );
-
-    if (fileInfo.thumbnailLink) {
-      // Modify the thumbnail URL size if needed
-      let thumbUrl = fileInfo.thumbnailLink;
-      // Replace size suffix (e.g., =s220 → =w400)
-      thumbUrl = thumbUrl.replace(/=s\d+/, `=${sz}`);
-
-      const thumbRes = await fetch(thumbUrl);
+    const thumbnailLink = fileData.thumbnailLink;
+    if (thumbnailLink) {
+      const sizedUrl = thumbnailLink.replace(/=s\d+$/, `=s${size}`);
+      const thumbRes = await fetch(sizedUrl);
       if (thumbRes.ok) {
         const contentType = thumbRes.headers.get("Content-Type") || "image/jpeg";
-        const body = thumbRes.body;
+        const body = await thumbRes.arrayBuffer();
         return new Response(body, {
           status: 200,
           headers: {
             ...CORS_HEADERS,
             "Content-Type": contentType,
-            "Cache-Control": "public, max-age=3600", // 1h cache
-            "X-DMGA-Source": "thumbnailLink",
-          },
-        });
-      }
-    }
-  } catch (err) {
-    console.error("Thumbnail strategy 1 failed:", err.message);
-  }
-
-  // Strategy 2: Fallback — use Drive alt=media with Range request
-  // This downloads just the beginning of the file, which for images
-  // is enough for a small preview. For videos, it won't produce
-  // a useful thumbnail, but at least won't error.
-  try {
-    const driveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.GOOGLE_DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
-    const driveRes = await fetch(driveUrl, {
-      headers: { "Range": "bytes=0-50000" }, // First 50KB — enough for a thumbnail
-    });
-
-    if (driveRes.ok || driveRes.status === 206) {
-      const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
-      // Only return image types (not video)
-      if (contentType.startsWith("image/")) {
-        const buf = await driveRes.arrayBuffer();
-        return new Response(buf, {
-          status: 200,
-          headers: {
-            ...CORS_HEADERS,
-            "Content-Type": contentType,
             "Cache-Control": "public, max-age=3600",
-            "X-DMGA-Source": "alt-media-range",
-          },
+            "Access-Control-Allow-Origin": "*"
+          }
         });
       }
     }
-  } catch (err) {
-    console.error("Thumbnail strategy 2 failed:", err.message);
+  } catch {
   }
-
-  // All strategies failed — return a 1x1 transparent PNG placeholder
-  const TRANSPARENT_PNG = Buffer.from(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
-    "base64"
-  );
-  return new Response(TRANSPARENT_PNG, {
-    status: 200,
-    headers: {
-      ...CORS_HEADERS,
-      "Content-Type": "image/png",
-      "Cache-Control": "no-cache",
-      "X-DMGA-Source": "placeholder",
-    },
-  });
-}
-
-// ── Main router ───────────────────────────────────────────────
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
-    }
-
-    try {
-      // ── Auth ──
-      if (path === "/auth/admin" && request.method === "POST") {
-        return await handleAdminLogin(request, env);
-      }
-      if (path === "/auth/guest" && request.method === "POST") {
-        return await handleGuestLogin(request, env);
-      }
-
-      // ── Folders ──
-      if (path === "/folders" && request.method === "GET") {
-        return await handleGetFolders(request, env);
-      }
-
-      // ── Files ──
-      if (path === "/files/root" && request.method === "GET") {
-        return await handleGetRootFiles(request, env);
-      }
-      if (path.startsWith("/files/") && request.method === "GET") {
-        const folderId = path.slice("/files/".length);
-        return await handleGetFiles(folderId, request, env);
-      }
-
-      // ── Key-file ──
-      if (path === "/keyfile/generate" && request.method === "POST") {
-        return await handleGenerateKeyFile(request, env);
-      }
-
-      // ── Media proxy (streaming) ──
-      // Support both GET (stream file) and HEAD (probe accessibility)
-      if (path.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
-        const fileId = path.slice("/media/".length);
-        return await handleMediaProxy(fileId, request, env);
-      }
-
-      // ── Thumbnail proxy (fast, small image) ──
-      if (path.startsWith("/thumbnail/") && request.method === "GET") {
-        const fileId = path.slice("/thumbnail/".length);
-        return await handleThumbnailProxy(fileId, request, env);
-      }
-
-      // ── Health check (for debugging env vars) ──
-      if (path === "/health") {
-        const status = {
-          ok: true,
-          hasApiKey: !!env.GOOGLE_DRIVE_API_KEY,
-          hasRootId: !!env.GOOGLE_DRIVE_ROOT_FOLDER_ID,
-          hasAdminPassword: !!env.ADMIN_PASSWORD,
-          hasTokenSecret: !!env.TOKEN_SECRET,
-          tokenSecretLength: env.TOKEN_SECRET?.length || 0,
-          worker: "dmga-api",
-        };
-        if (!status.hasApiKey || !status.hasRootId || !status.hasTokenSecret) {
-          status.ok = false;
-          status.missing = [];
-          if (!status.hasApiKey) status.missing.push("GOOGLE_DRIVE_API_KEY");
-          if (!status.hasRootId) status.missing.push("GOOGLE_DRIVE_ROOT_FOLDER_ID");
-          if (!status.hasTokenSecret) status.missing.push("TOKEN_SECRET");
+  const thumbUrl = `https://drive.google.com/thumbnail?id=${fileId}&sz=w${size}`;
+  try {
+    const thumbRes = await fetch(thumbUrl, {
+      headers: { "Authorization": `Bearer ${env.DRIVE_API_KEY}` }
+    });
+    if (thumbRes.ok) {
+      const contentType = thumbRes.headers.get("Content-Type") || "image/jpeg";
+      const body = await thumbRes.arrayBuffer();
+      return new Response(body, {
+        status: 200,
+        headers: {
+          ...CORS_HEADERS,
+          "Content-Type": contentType,
+          "Cache-Control": "public, max-age=3600"
         }
-        return corsResponse(JSON.stringify(status, null, 2), status.ok ? 200 : 500);
-      }
-
-      // ── 404 ──
-      return corsResponse(JSON.stringify({ error: "Not found" }), 404);
-
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Внутренняя ошибка";
-      const status =
-        message.includes("авториза") || message.includes("пароль") || message.includes("токен") || message.includes("not configured")
-          ? 401
-          : message.includes("Доступ")
-          ? 403
-          : 500;
-      return corsResponse(JSON.stringify({ error: message }), status);
+      });
     }
-  },
+  } catch {
+  }
+  return json({ error: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u043C\u0438\u043D\u0438\u0430\u0442\u044E\u0440\u0443" }, 404);
+}
+var index_default = {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+    const url = new URL(request.url);
+    try {
+      if (url.pathname === "/auth/admin" && request.method === "POST") {
+        return handleAdminAuth(request, env);
+      }
+      if (url.pathname === "/auth/guest" && request.method === "POST") {
+        return handleGuestAuth(request, env);
+      }
+      if (url.pathname === "/keyfile/generate" && request.method === "POST") {
+        return handleKeyFileGenerate(request, env);
+      }
+      if (url.pathname === "/folders" && request.method === "GET") {
+        return handleFolders(request, env);
+      }
+      if (url.pathname === "/files/root" && request.method === "GET") {
+        return handleRootFiles(request, env);
+      }
+      if (url.pathname === "/files/batch" && request.method === "GET") {
+        return handleBatchFiles(request, env);
+      }
+      if (url.pathname.startsWith("/files/") && request.method === "GET") {
+        const folderId = url.pathname.slice(7);
+        return handleFiles(request, env, folderId);
+      }
+      if (url.pathname.startsWith("/thumbnail/") && request.method === "GET") {
+        const fileId = url.pathname.slice(11);
+        return handleThumbnail(request, env, fileId);
+      }
+      if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
+        const fileId = url.pathname.slice(7);
+        return handleMedia(request, env, fileId);
+      }
+      if (url.pathname === "/") {
+        return json({ status: "ok", service: "DMGA API Proxy" });
+      }
+      return json({ error: "Not found" }, 404);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Internal server error";
+      return json({ error: message }, 500);
+    }
+  }
+};
+export {
+  index_default as default
 };
