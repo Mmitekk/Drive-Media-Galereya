@@ -343,7 +343,7 @@ export const StoryPlayer = forwardRef(function StoryPlayer(
                 className="h-full rounded-full transition-all duration-300"
                 style={{
                   width: isPast ? "100%" : isCurrent ? `${progress * 100}%` : "0%",
-                  backgroundColor: isCurrent ? "white" : "rgba(255,255,255,0.6)",
+                  backgroundColor: isPast || isCurrent ? "white" : "rgba(255,255,255,0.6)",
                 }}
               />
             </div>
