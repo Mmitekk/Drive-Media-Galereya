@@ -363,24 +363,10 @@ export function useDataLoader() {
     prevTokenRef.current = token;
   }, [token, setInitialized]);
 
-  // Auto-reload when tab becomes visible after being hidden
-  const lastReloadRef = useRef(0);
-  useEffect(() => {
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible" && initialized && token) {
-        // Don't reload more often than every 60 seconds
-        const now = Date.now();
-        if (now - lastReloadRef.current < 60_000) return;
-        lastReloadRef.current = now;
-        // Delay to let the browser recover network state
-        setTimeout(() => {
-          loadAll();
-        }, 2000);
-      }
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [initialized, token, loadAll]);
+  // REMOVED: Auto-reload on visibilitychange — this was causing the gallery
+  // to disappear when the user is watching a video. The reload would fail
+  // (Worker timeout during video playback) and setError() would hide the
+  // entire gallery. Users can still manually reload with the refresh button.
 
   return { reload: loadAll, loading, initialized };
 }

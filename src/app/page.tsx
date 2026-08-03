@@ -343,9 +343,9 @@ function GalleryApp() {
 
         {/* Main content */}
         <main className="flex-1 p-4 sm:p-6 max-w-[1600px] mx-auto w-full">
-          {/* Error */}
+          {/* Error — show as warning when we have cached data, blocking only when no data */}
           {error && (
-            <Alert variant="destructive" className="mb-6">
+            <Alert variant={initialized ? "default" : "destructive"} className="mb-6">
               <AlertCircle className="h-4 w-4" />
               <AlertDescription className="flex items-center justify-between">
                 <span>{error}</span>
@@ -357,7 +357,7 @@ function GalleryApp() {
           )}
 
           {/* Search & Filter */}
-          {initialized && !error && (
+          {initialized && (
             <SearchFilter className="mb-6" />
           )}
 
@@ -377,8 +377,8 @@ function GalleryApp() {
             </div>
           )}
 
-          {/* Gallery */}
-          {initialized && !error && <MediaGallery />}
+          {/* Gallery — always show when initialized, even if there's an error (cached data) */}
+          {initialized && <MediaGallery />}
         </main>
       </div>
     </div>
