@@ -3,7 +3,9 @@ var CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
-  "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-DMGA-Status"
+  "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-DMGA-Status",
+  "Access-Control-Max-Age": "86400"
+  // Cache preflight for 24h — reduces OPTIONS requests
 };
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -242,44 +244,66 @@ async function handleFolders(request, env) {
   const MAX_DEPTH = 10;
   const MAX_FOLDERS = 500;
   const CHUNK_SIZE = 25;
-  const WALL_TIME_MS = 2e4;
+  const MAX_SUBREQUESTS = 45;
+  const WALL_TIME_MS = 12e3;
   const startTime = Date.now();
+  let totalSubrequests = 0;
+  let chunkErrors = 0;
   for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
     if (Date.now() - startTime > WALL_TIME_MS) {
       console.log(`[DMGA] BFS timeout after ${depth} levels, ${allFolders.length} folders, ${Date.now() - startTime}ms`);
       break;
     }
-    const nextLevel = [];
+    if (totalSubrequests >= MAX_SUBREQUESTS) {
+      console.log(`[DMGA] BFS subrequest limit reached at depth ${depth}, ${allFolders.length} folders`);
+      break;
+    }
+    const chunks = [];
     for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
-      if (Date.now() - startTime > WALL_TIME_MS) break;
-      const chunk = currentLevel.slice(i, i + CHUNK_SIZE);
-      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
-      const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-      const data = await driveFetch(
-        "/files",
-        {
-          q: query,
-          fields: "files(id, name, createdTime, parents)",
-          pageSize: "500",
-          orderBy: "name",
-          supportsAllDrives: "true",
-          includeItemsFromAllDrives: "true"
-        },
-        env.DRIVE_API_KEY
-      );
-      const folders2 = data.files || [];
-      for (const folder of folders2) {
-        const id = folder.id;
-        if (!visited.has(id)) {
-          visited.add(id);
-          allFolders.push(folder);
-          nextLevel.push(id);
+      chunks.push(currentLevel.slice(i, i + CHUNK_SIZE));
+    }
+    if (totalSubrequests + chunks.length > MAX_SUBREQUESTS) {
+      chunks.length = MAX_SUBREQUESTS - totalSubrequests;
+    }
+    totalSubrequests += chunks.length;
+    const results = await Promise.allSettled(
+      chunks.map(async (chunk) => {
+        const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+        const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        const data = await driveFetch(
+          "/files",
+          {
+            q: query,
+            fields: "files(id, name, createdTime, parents)",
+            pageSize: "500",
+            orderBy: "name",
+            supportsAllDrives: "true",
+            includeItemsFromAllDrives: "true"
+          },
+          env.DRIVE_API_KEY
+        );
+        return data.files || [];
+      })
+    );
+    const nextLevel = [];
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        for (const folder of result.value) {
+          const id = folder.id;
+          if (!visited.has(id)) {
+            visited.add(id);
+            allFolders.push(folder);
+            nextLevel.push(id);
+          }
         }
+      } else {
+        chunkErrors++;
+        console.error(`[DMGA] BFS chunk error at depth ${depth}: ${result.reason}`);
       }
     }
     currentLevel = nextLevel;
   }
-  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms`);
+  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms, ${totalSubrequests} subrequests, ${chunkErrors} chunk errors`);
   let folders = allFolders;
   if (auth.role === "guest" && auth.adminFolders?.length > 0) {
     const adminFolders = auth.adminFolders;
@@ -329,32 +353,44 @@ async function handleBatchFiles(request, env) {
     return json({ files: {} });
   }
   const BATCH_CHUNK_SIZE = 25;
+  const allowedSet = new Set(allowedFolderIds);
   const filesByFolder = {};
+  const chunks = [];
   for (let i = 0; i < allowedFolderIds.length; i += BATCH_CHUNK_SIZE) {
-    const chunk = allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE);
-    const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
-    const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
-    const data = await driveFetch(
-      "/files",
-      {
-        q: query,
-        fields: "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
-        pageSize: "1000",
-        orderBy: "createdTime desc",
-        supportsAllDrives: "true",
-        includeItemsFromAllDrives: "true"
-      },
-      env.DRIVE_API_KEY
-    );
-    const rawFiles = data.files || [];
-    for (const file of rawFiles) {
-      const parents = file.parents || [];
-      for (const parentId of parents) {
-        if (allowedFolderIds.includes(parentId)) {
-          if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
-          filesByFolder[parentId].push(file);
+    chunks.push(allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE));
+  }
+  const results = await Promise.allSettled(
+    chunks.map(async (chunk) => {
+      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+      const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
+      const data = await driveFetch(
+        "/files",
+        {
+          q: query,
+          fields: "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+          pageSize: "1000",
+          orderBy: "createdTime desc",
+          supportsAllDrives: "true",
+          includeItemsFromAllDrives: "true"
+        },
+        env.DRIVE_API_KEY
+      );
+      return data.files || [];
+    })
+  );
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      for (const file of result.value) {
+        const parents = file.parents || [];
+        for (const parentId of parents) {
+          if (allowedSet.has(parentId)) {
+            if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
+            filesByFolder[parentId].push(file);
+          }
         }
       }
+    } else {
+      console.error(`[DMGA] Batch files chunk error: ${result.reason}`);
     }
   }
   for (const folderId of allowedFolderIds) {

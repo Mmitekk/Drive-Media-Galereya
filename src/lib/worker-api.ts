@@ -44,29 +44,43 @@ function apiUrl(path: string): string {
   return `${WORKER_URL}${path}`;
 }
 
-const MAX_RETRIES = 4;
-const RETRY_DELAYS = [1000, 3000, 6000, 10000]; // ms — exponential backoff
+// ── Retry strategy ──
+// Auth endpoints: 1 retry (they should be fast)
+// Data endpoints (/folders, /files): 2 retries (Worker BFS can be slow on cold start)
+// Other: 3 retries
+const MAX_RETRIES_AUTH = 1;
+const MAX_RETRIES_DATA = 2;
+const MAX_RETRIES_DEFAULT = 3;
+const RETRY_DELAYS = [1000, 3000, 6000]; // ms — exponential backoff
+
+function getMaxRetriesForPath(path: string): number {
+  if (path.startsWith("/auth")) return MAX_RETRIES_AUTH;
+  if (path.startsWith("/folders") || path.startsWith("/files")) return MAX_RETRIES_DATA;
+  return MAX_RETRIES_DEFAULT;
+}
 
 /**
  * Make an authenticated JSON request to the Worker API.
  *
  * Timeout strategy:
  *  - Auth endpoints (/auth/*) — 15s (fast, should never be slow)
- *  - Data endpoints (/folders, /files/*) — 90s (BFS folder fetch can be VERY slow)
- *  - Default — 30s
+ *  - Data endpoints (/folders, /files/*) — 30s (Worker has 30s wall limit on Cloudflare;
+ *    no point waiting longer — the Worker is already dead)
+ *  - Default — 20s
  */
 function getTimeoutForPath(path: string): number {
   if (path.startsWith("/auth")) return 15_000;
-  if (path.startsWith("/folders") || path.startsWith("/files")) return 90_000;
-  return 30_000;
+  if (path.startsWith("/folders") || path.startsWith("/files")) return 30_000;
+  return 20_000;
 }
 
 async function requestJSON<T>(path: string, options: RequestInit = {}): Promise<T> {
   let lastError: Error | null = null;
   const timeout = getTimeoutForPath(path);
+  const maxRetries = getMaxRetriesForPath(path);
   const url = apiUrl(path);
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // Create a new AbortController for each attempt so a timed-out request
     // doesn't carry over to the next retry.
     const controller = new AbortController();
@@ -110,8 +124,8 @@ async function requestJSON<T>(path: string, options: RequestInit = {}): Promise<
       }
 
       // If we have retries left, wait and try again
-      if (attempt < MAX_RETRIES) {
-        const delay = RETRY_DELAYS[attempt];
+      if (attempt < maxRetries) {
+        const delay = RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)];
         console.log(`[DMGA] retry ${path} in ${delay}ms...`);
         await new Promise((r) => setTimeout(r, delay));
       }

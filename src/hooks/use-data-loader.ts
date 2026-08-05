@@ -85,8 +85,9 @@ function loadDataCache(role: string | null): DataCache | null {
     const cache: DataCache = JSON.parse(raw);
     // Only use cache for the same role (admin vs guest)
     if (cache.role !== role) return null;
-    // Don't use cache older than 24 hours
-    if (Date.now() - cache.timestamp > 24 * 60 * 60 * 1000) return null;
+    // Don't use cache older than 7 days — generous cache so the gallery
+    // always shows something even if the Worker is temporarily down
+    if (Date.now() - cache.timestamp > 7 * 24 * 60 * 60 * 1000) return null;
     return cache;
   } catch {
     return null;

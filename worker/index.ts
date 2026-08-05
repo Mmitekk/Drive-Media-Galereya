@@ -31,6 +31,7 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
   "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-DMGA-Status",
+  "Access-Control-Max-Age": "86400", // Cache preflight for 24h — reduces OPTIONS requests
 };
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -380,15 +381,22 @@ async function handleFolders(
   // The old code only fetched direct children of the root folder.
   // This missed nested subfolders like "Видео / Как Шерон Стоун / Красотка в белом".
   // Now we walk the entire folder tree level by level.
+  // OPTIMIZATION: chunks within each level are fetched IN PARALLEL (Promise.all)
+  //   instead of sequentially — reduces wall time from ~20s to ~3-5s.
   // SAFETY: stops after MAX_DEPTH levels, MAX_FOLDERS folders, or WALL_TIME_MS.
+  // RESILIENCE: each chunk is wrapped in try/catch — one Drive API error
+  //   doesn't kill the entire response; we return whatever we found so far.
   const allFolders: Record<string, unknown>[] = [];
   let currentLevel = [env.DRIVE_ROOT_FOLDER_ID];
   const visited = new Set<string>([env.DRIVE_ROOT_FOLDER_ID]);
   const MAX_DEPTH = 10;      // Don't go deeper than 10 levels
   const MAX_FOLDERS = 500;   // Don't discover more than 500 folders
   const CHUNK_SIZE = 25;     // Max parent IDs per Drive API query (avoid URL length limits)
-  const WALL_TIME_MS = 20_000; // Stop BFS after 20s to avoid Cloudflare Worker timeout (30s)
+  const MAX_SUBREQUESTS = 45; // Cloudflare limit is 50; reserve 5 for safety
+  const WALL_TIME_MS = 12_000; // Stop BFS after 12s — leave room for JSON serialization & network
   const startTime = Date.now();
+  let totalSubrequests = 0;
+  let chunkErrors = 0;
 
   for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
     // Check wall-clock time before each level
@@ -396,46 +404,69 @@ async function handleFolders(
       console.log(`[DMGA] BFS timeout after ${depth} levels, ${allFolders.length} folders, ${Date.now() - startTime}ms`);
       break;
     }
+    // Check subrequest limit
+    if (totalSubrequests >= MAX_SUBREQUESTS) {
+      console.log(`[DMGA] BFS subrequest limit reached at depth ${depth}, ${allFolders.length} folders`);
+      break;
+    }
+
+    // Build all chunk queries for this level
+    const chunks: string[][] = [];
+    for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
+      chunks.push(currentLevel.slice(i, i + CHUNK_SIZE));
+    }
+
+    // Check if we'd exceed subrequest limit
+    if (totalSubrequests + chunks.length > MAX_SUBREQUESTS) {
+      // Trim to fit
+      chunks.length = MAX_SUBREQUESTS - totalSubrequests;
+    }
+    totalSubrequests += chunks.length;
+
+    // Execute all chunks IN PARALLEL within this level
+    const results = await Promise.allSettled(
+      chunks.map(async (chunk) => {
+        const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+        const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+
+        const data = await driveFetch(
+          "/files",
+          {
+            q: query,
+            fields: "files(id, name, createdTime, parents)",
+            pageSize: "500",
+            orderBy: "name",
+            supportsAllDrives: "true",
+            includeItemsFromAllDrives: "true",
+          },
+          env.DRIVE_API_KEY
+        );
+
+        return (data.files as Record<string, unknown>[]) || [];
+      })
+    );
 
     const nextLevel: string[] = [];
-
-    // Process current level in chunks to avoid Drive API query length limits
-    for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
-      // Check time before each chunk too
-      if (Date.now() - startTime > WALL_TIME_MS) break;
-
-      const chunk = currentLevel.slice(i, i + CHUNK_SIZE);
-      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
-      const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-
-      const data = await driveFetch(
-        "/files",
-        {
-          q: query,
-          fields: "files(id, name, createdTime, parents)",
-          pageSize: "500",
-          orderBy: "name",
-          supportsAllDrives: "true",
-          includeItemsFromAllDrives: "true",
-        },
-        env.DRIVE_API_KEY
-      );
-
-      const folders = (data.files as Record<string, unknown>[]) || [];
-      for (const folder of folders) {
-        const id = folder.id as string;
-        if (!visited.has(id)) {
-          visited.add(id);
-          allFolders.push(folder);
-          nextLevel.push(id);
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        for (const folder of result.value) {
+          const id = folder.id as string;
+          if (!visited.has(id)) {
+            visited.add(id);
+            allFolders.push(folder);
+            nextLevel.push(id);
+          }
         }
+      } else {
+        chunkErrors++;
+        console.error(`[DMGA] BFS chunk error at depth ${depth}: ${result.reason}`);
       }
     }
 
     currentLevel = nextLevel;
   }
 
-  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms`);
+  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms, ${totalSubrequests} subrequests, ${chunkErrors} chunk errors`);
 
   let folders = allFolders;
 
@@ -517,38 +548,57 @@ async function handleBatchFiles(
   // ── Chunked batch: split folder IDs into chunks to avoid Drive API query length limits ──
   // With nested subfolders, the list of IDs can be very long (50+).
   // Each `'ID' in parents` clause is ~35 chars, so ~25 IDs per query is safe.
+  // OPTIMIZATION: all chunks are fetched IN PARALLEL (Promise.allSettled)
+  //   instead of sequentially — much faster for large folder lists.
+  // RESILIENCE: one chunk error doesn't kill the entire response.
   const BATCH_CHUNK_SIZE = 25;
+  const allowedSet = new Set(allowedFolderIds);
   const filesByFolder: Record<string, Record<string, unknown>[]> = {};
 
+  // Build chunks
+  const chunks: string[][] = [];
   for (let i = 0; i < allowedFolderIds.length; i += BATCH_CHUNK_SIZE) {
-    const chunk = allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE);
-    const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
-    const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
+    chunks.push(allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE));
+  }
 
-    const data = await driveFetch(
-      "/files",
-      {
-        q: query,
-        fields:
-          "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
-        pageSize: "1000",
-        orderBy: "createdTime desc",
-        supportsAllDrives: "true",
-        includeItemsFromAllDrives: "true",
-      },
-      env.DRIVE_API_KEY
-    );
+  // Execute all chunks IN PARALLEL
+  const results = await Promise.allSettled(
+    chunks.map(async (chunk) => {
+      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+      const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
 
-    // Group files by their parent folder
-    const rawFiles = (data.files as Record<string, unknown>[]) || [];
-    for (const file of rawFiles) {
-      const parents = (file.parents as string[]) || [];
-      for (const parentId of parents) {
-        if (allowedFolderIds.includes(parentId)) {
-          if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
-          filesByFolder[parentId].push(file);
+      const data = await driveFetch(
+        "/files",
+        {
+          q: query,
+          fields:
+            "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+          pageSize: "1000",
+          orderBy: "createdTime desc",
+          supportsAllDrives: "true",
+          includeItemsFromAllDrives: "true",
+        },
+        env.DRIVE_API_KEY
+      );
+
+      return (data.files as Record<string, unknown>[]) || [];
+    })
+  );
+
+  // Group files by parent folder from all successful chunk results
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      for (const file of result.value) {
+        const parents = (file.parents as string[]) || [];
+        for (const parentId of parents) {
+          if (allowedSet.has(parentId)) {
+            if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
+            filesByFolder[parentId].push(file);
+          }
         }
       }
+    } else {
+      console.error(`[DMGA] Batch files chunk error: ${result.reason}`);
     }
   }
 
