@@ -380,18 +380,30 @@ async function handleFolders(
   // The old code only fetched direct children of the root folder.
   // This missed nested subfolders like "Видео / Как Шерон Стоун / Красотка в белом".
   // Now we walk the entire folder tree level by level.
+  // SAFETY: stops after MAX_DEPTH levels, MAX_FOLDERS folders, or WALL_TIME_MS.
   const allFolders: Record<string, unknown>[] = [];
   let currentLevel = [env.DRIVE_ROOT_FOLDER_ID];
   const visited = new Set<string>([env.DRIVE_ROOT_FOLDER_ID]);
-  const MAX_DEPTH = 10;   // Safety: don't go deeper than 10 levels
-  const MAX_FOLDERS = 500; // Safety: don't discover more than 500 folders
-  const CHUNK_SIZE = 25;   // Max parent IDs per Drive API query (avoid URL length limits)
+  const MAX_DEPTH = 10;      // Don't go deeper than 10 levels
+  const MAX_FOLDERS = 500;   // Don't discover more than 500 folders
+  const CHUNK_SIZE = 25;     // Max parent IDs per Drive API query (avoid URL length limits)
+  const WALL_TIME_MS = 20_000; // Stop BFS after 20s to avoid Cloudflare Worker timeout (30s)
+  const startTime = Date.now();
 
   for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
+    // Check wall-clock time before each level
+    if (Date.now() - startTime > WALL_TIME_MS) {
+      console.log(`[DMGA] BFS timeout after ${depth} levels, ${allFolders.length} folders, ${Date.now() - startTime}ms`);
+      break;
+    }
+
     const nextLevel: string[] = [];
 
     // Process current level in chunks to avoid Drive API query length limits
     for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
+      // Check time before each chunk too
+      if (Date.now() - startTime > WALL_TIME_MS) break;
+
       const chunk = currentLevel.slice(i, i + CHUNK_SIZE);
       const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
       const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
@@ -422,6 +434,8 @@ async function handleFolders(
 
     currentLevel = nextLevel;
   }
+
+  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms`);
 
   let folders = allFolders;
 

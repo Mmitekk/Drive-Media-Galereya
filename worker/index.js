@@ -242,9 +242,16 @@ async function handleFolders(request, env) {
   const MAX_DEPTH = 10;
   const MAX_FOLDERS = 500;
   const CHUNK_SIZE = 25;
+  const WALL_TIME_MS = 2e4;
+  const startTime = Date.now();
   for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
+    if (Date.now() - startTime > WALL_TIME_MS) {
+      console.log(`[DMGA] BFS timeout after ${depth} levels, ${allFolders.length} folders, ${Date.now() - startTime}ms`);
+      break;
+    }
     const nextLevel = [];
     for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
+      if (Date.now() - startTime > WALL_TIME_MS) break;
       const chunk = currentLevel.slice(i, i + CHUNK_SIZE);
       const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
       const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
@@ -272,6 +279,7 @@ async function handleFolders(request, env) {
     }
     currentLevel = nextLevel;
   }
+  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms`);
   let folders = allFolders;
   if (auth.role === "guest" && auth.adminFolders?.length > 0) {
     const adminFolders = auth.adminFolders;

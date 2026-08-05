@@ -324,11 +324,15 @@ export function useDataLoader() {
 
       setInitialized(true);
     } catch (err) {
-      setError(friendlyErrorMessage(err));
-      // Even on error, if we have partial data, mark as initialized
-      // so the user can see what loaded
+      const errMsg = friendlyErrorMessage(err);
+      // Even on error, if we have data (from this load or cache), keep it visible
       if (folders.length > 0 || Object.keys(filesByFolder).length > 0) {
         setInitialized(true);
+        // Show as non-blocking warning, not destructive error
+        // so the gallery stays visible
+        setError(errMsg);
+      } else {
+        setError(errMsg);
       }
     } finally {
       setLoading(false);
