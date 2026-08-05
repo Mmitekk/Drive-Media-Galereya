@@ -6,14 +6,14 @@
 // Subfolders: blue→cyan→teal gradient
 // "Watch all" button to play all videos
 // ============================================================
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import type { DriveFile, DriveFolder } from "@/lib/types";
 import { useAppStore } from "@/lib/store";
 import { useAuth, getWorkerToken } from "@/lib/auth-context";
 import { MediaCard } from "./media-card";
 import { StoryPlayer } from "./story-player";
 import { ImageLightbox } from "./image-lightbox";
-import { getWorkerThumbnailUrl, getWorkerMediaUrl } from "@/lib/google-drive";
+import { getWorkerThumbnailUrl, getWorkerMediaUrl, getThumbnailUrl } from "@/lib/google-drive";
 import { Video, ImageIcon, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -84,29 +84,19 @@ export function MediaGallery() {
     };
   }, [folders, filesByFolder]);
 
-  // Get first thumbnail for a folder (for Stories circle)
-  // Primary: thumbnailLink (direct Google CDN — fast, no Worker needed)
-  // Fallback: Worker thumbnail proxy
-  const getFolderThumb = useMemo(() => {
-    return (folderId: string): string | null => {
+  // Get first file with a thumbnail for a folder (for Stories circle)
+  // Used by StoryThumb component which has multi-level fallback
+  const getFolderFirstFile = useMemo(() => {
+    return (folderId: string): DriveFile | null => {
       const ids = collectDescendantIds(folders, folderId);
       for (const id of ids) {
         const folderFiles = filesByFolder[id] || [];
         const first = folderFiles[0];
-        if (first) {
-          // Use thumbnailLink as primary — it's a direct Google CDN URL
-          // that works without Worker involvement
-          if (first.thumbnailLink) {
-            // Enlarge thumbnail from =s220 to =s400 for better quality
-            return first.thumbnailLink.replace(/=s\d+$/, "=s400");
-          }
-          // Fallback: Worker thumbnail proxy
-          return getWorkerThumbnailUrl(first.id, workerToken || undefined, 400);
-        }
+        if (first) return first;
       }
       return null;
     };
-  }, [folders, filesByFolder, workerToken]);
+  }, [folders, filesByFolder]);
 
   // Get count of videos in folder tree
   const getVideoCount = useMemo(() => {
@@ -227,7 +217,7 @@ export function MediaGallery() {
               const videoCount = getVideoCount(folder.id);
               if (videoCount === 0) return null;
 
-              const thumb = getFolderThumb(folder.id);
+              const firstFile = getFolderFirstFile(folder.id);
               const isTopLevel = !folder.parentId || !folders.some((f) => f.id === folder.parentId);
               const size = isTopLevel ? "w-[68px] h-[68px]" : "w-[58px] h-[58px]";
               const gradient = isTopLevel
@@ -245,18 +235,7 @@ export function MediaGallery() {
                     className={`${size} rounded-full bg-gradient-to-br ${gradient} p-[3px] group-hover:scale-105 transition-transform`}
                   >
                     <div className="w-full h-full rounded-full overflow-hidden bg-background">
-                      {thumb ? (
-                        <img
-                          src={thumb}
-                          alt={folder.name}
-                          loading="lazy"
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center bg-muted">
-                          <Video className="h-5 w-5 text-muted-foreground" />
-                        </div>
-                      )}
+                      <StoryThumb file={firstFile} workerToken={workerToken || undefined} />
                     </div>
                   </div>
                   {/* Name */}
@@ -328,4 +307,61 @@ function collectDescendantIds(folders: DriveFolder[], parentId: string): string[
     ids.push(...collectDescendantIds(folders, child.id));
   }
   return ids;
+}
+
+// ── Story thumbnail with multi-level fallback ──────────────
+// Prevents broken image icons when a thumbnail URL fails.
+// Fallback chain:
+//   1. thumbnailLink (Google CDN — fast but may not work for private files)
+//   2. Worker thumbnail proxy (/thumbnail/{fileId}?token=...)
+//   3. Generic Drive thumbnail (drive.google.com/thumbnail?id=...)
+//   4. Placeholder icon (Video)
+
+function StoryThumb({ file, workerToken }: { file: DriveFile | null; workerToken?: string }) {
+  const [fallbackLevel, setFallbackLevel] = useState(0);
+
+  const handleError = useCallback(() => {
+    setFallbackLevel((prev) => prev + 1);
+  }, []);
+
+  if (!file) {
+    return (
+      <div className="w-full h-full flex items-center justify-center bg-muted">
+        <Video className="h-5 w-5 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  // Build all possible URLs (skip nulls to get a flat list)
+  const urls: string[] = [];
+  if (file.thumbnailLink) {
+    urls.push(file.thumbnailLink.replace(/=s\d+$/, "=s400"));
+  }
+  if (workerToken) {
+    urls.push(getWorkerThumbnailUrl(file.id, workerToken, 400));
+  }
+  urls.push(getThumbnailUrl(file.id, 400));
+
+  // Current URL to try
+  const currentUrl = fallbackLevel < urls.length ? urls[fallbackLevel] : null;
+
+  // All URLs exhausted → show placeholder
+  if (!currentUrl) {
+    return (
+      <div className="w-full h-full flex items-center justify-center bg-muted">
+        <Video className="h-5 w-5 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <img
+      key={`${file.id}-${fallbackLevel}`}
+      src={currentUrl}
+      alt=""
+      loading="lazy"
+      onError={handleError}
+      className="w-full h-full object-cover"
+    />
+  );
 }

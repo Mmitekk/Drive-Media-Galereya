@@ -22,7 +22,7 @@ import {
   forwardRef,
 } from "react";
 import type { DriveFile } from "@/lib/types";
-import { getWorkerMediaUrl } from "@/lib/worker-api";
+import { getWorkerMediaUrl, getWorkerThumbnailUrl } from "@/lib/worker-api";
 import { X, ChevronLeft, ChevronRight, SkipForward, Pause, Play, Volume2, VolumeX, ExternalLink, Repeat, Repeat1 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -315,10 +315,16 @@ export const StoryPlayer = forwardRef(function StoryPlayer(
 
   if (!current) return null;
 
-  // Use thumbnailLink as primary — direct Google CDN, works without Worker
-  const thumbUrl = current.thumbnailLink
-    ? current.thumbnailLink.replace(/=s\d+$/, "=s800")
-    : `https://drive.google.com/thumbnail?id=${current.id}&sz=w800`;
+  // Build thumbnail URL chain for the avatar
+  // Primary: thumbnailLink (Google CDN), Fallback: Drive thumbnail, Fallback: Worker proxy
+  const thumbUrls: string[] = [];
+  if (current.thumbnailLink) {
+    thumbUrls.push(current.thumbnailLink.replace(/=s\d+$/, "=s800"));
+  }
+  thumbUrls.push(`https://drive.google.com/thumbnail?id=${current.id}&sz=w800`);
+  if (token) {
+    thumbUrls.push(getWorkerThumbnailUrl(current.id, token, 800));
+  }
 
   return (
     <div
@@ -354,9 +360,7 @@ export const StoryPlayer = forwardRef(function StoryPlayer(
       {/* Top bar */}
       <div className="absolute top-7 left-0 right-0 z-20 flex items-center justify-between px-4">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-white/20 overflow-hidden">
-            <img src={thumbUrl} alt="" className="w-full h-full object-cover" />
-          </div>
+          <StoryAvatarThumb urls={thumbUrls} />
           <div>
             <p className="text-white text-sm font-medium truncate max-w-[200px]">
               {current.name.replace(/\.[^.]+$/, "")}
@@ -533,3 +537,27 @@ export const StoryPlayer = forwardRef(function StoryPlayer(
     </div>
   );
 });
+
+// ── Story avatar thumbnail with fallback ──────────────────
+// Small 8×8 circle in the top-left of the story player.
+// Tries multiple URLs; if all fail, shows a placeholder circle.
+
+function StoryAvatarThumb({ urls }: { urls: string[] }) {
+  const [level, setLevel] = useState(0);
+
+  if (level >= urls.length || urls.length === 0) {
+    return <div className="w-8 h-8 rounded-full bg-white/20" />;
+  }
+
+  return (
+    <div className="w-8 h-8 rounded-full bg-white/20 overflow-hidden">
+      <img
+        key={`avatar-${level}`}
+        src={urls[level]}
+        alt=""
+        className="w-full h-full object-cover"
+        onError={() => setLevel((prev) => prev + 1)}
+      />
+    </div>
+  );
+}
