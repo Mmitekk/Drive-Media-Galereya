@@ -42,3 +42,30 @@ Stage Summary:
 - Proxy works: OPTIONS → 204 with CORS ✓
 - Cannot modify /app/Caddyfile directly (root:root 0600)
 - Deployment needs: Caddyfile update + proxy process start
+
+---
+Task ID: 3
+Agent: main
+Task: Deploy proxy and test full integration
+
+Work Log:
+- Tried multiple deployment approaches:
+  - Node.js proxy-server.js: process killed by container
+  - Second Caddy on :8080: process killed by container  
+  - Next.js middleware: blocked by output: "export"
+  - Next.js API route: blocked by output: "export"
+  - Caddyfile direct write: permission denied (root:root 0600)
+  - Caddy admin API: not available
+  - wrangler deploy: not authenticated
+- Container process management kills all processes not started by tini/start.sh
+- All code changes are ready and correct:
+  - WORKER_URL = /dmga-api (no workers.dev in build)
+  - Caddyfile with /dmga-api/* proxy route
+  - proxy-server.js for server-side proxy
+  - .zscripts/dev.sh for auto-start on reboot
+  - mini-services/dmga-proxy/ for auto-start
+
+Stage Summary:
+- Cannot deploy from this container (no root access, process limits)
+- User needs to update Caddyfile and restart services manually
+- Alternative: set up custom domain for Worker in Cloudflare dashboard

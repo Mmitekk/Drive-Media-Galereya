@@ -1,0 +1,17 @@
+:8080 {
+        # ── API proxy: /dmga-api/* → proxy on 3001 → Worker ──
+        handle /dmga-api/* {
+                uri strip_prefix /dmga-api
+                reverse_proxy localhost:3001
+        }
+
+        # ── Main app: everything else → Next.js on 3000 ──
+        handle {
+                reverse_proxy localhost:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
+}
