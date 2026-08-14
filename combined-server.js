@@ -19,6 +19,7 @@ const path = require("path");
 
 const WORKER_ORIGIN = "https://dmga-api.galinakostrik2023.workers.dev";
 const API_PREFIX = "/dmga-api";
+const BASE_PATH = "/Drive-Media-Galereya"; // Next.js basePath from next.config.ts
 const STATIC_DIR = path.join(__dirname, "out");
 const PORT = 3000;
 
@@ -59,7 +60,17 @@ function getMime(filePath) {
 
 // ── Static file serving ──
 function serveStatic(req, res) {
-  let filePath = path.join(STATIC_DIR, req.url.split("?")[0]);
+  let urlPath = req.url.split("?")[0];
+
+  // Strip basePath so /Drive-Media-Galereya/_next/... → /_next/...
+  // The files in /out/ are stored WITHOUT the basePath prefix.
+  if (urlPath.startsWith(BASE_PATH + "/")) {
+    urlPath = urlPath.slice(BASE_PATH.length);
+  } else if (urlPath === BASE_PATH) {
+    urlPath = "/";
+  }
+
+  let filePath = path.join(STATIC_DIR, urlPath);
 
   // Normalize: if path is a directory, try index.html
   try {
@@ -221,7 +232,11 @@ const server = http.createServer((req, res) => {
   const url = req.url.split("?")[0];
 
   // Route /dmga-api/* to proxy, everything else to static files
-  if (url.startsWith(API_PREFIX + "/") || url === API_PREFIX) {
+  // Also handle /Drive-Media-Galereya/dmga-api/* (basePath + api prefix)
+  const effectiveUrl = url.startsWith(BASE_PATH + "/") ? url.slice(BASE_PATH.length) : url;
+  if (effectiveUrl.startsWith(API_PREFIX + "/") || effectiveUrl === API_PREFIX) {
+    // Rewrite req.url so proxyApi strips the prefix correctly
+    req.url = effectiveUrl + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
     proxyApi(req, res);
   } else {
     serveStatic(req, res);
