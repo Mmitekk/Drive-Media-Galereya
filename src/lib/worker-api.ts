@@ -4,7 +4,7 @@
 // Worker URL is injected at build time via NEXT_PUBLIC_WORKER_URL
 // Hardcoded fallback prevents breakage if .env is accidentally wiped
 
-const FALLBACK_WORKER_URL = "https://dmga-api.galinakostrik2023.workers.dev";
+const FALLBACK_WORKER_URL = "/dmga-api";
 
 const WORKER_URL =
   process.env.NEXT_PUBLIC_WORKER_URL || FALLBACK_WORKER_URL;

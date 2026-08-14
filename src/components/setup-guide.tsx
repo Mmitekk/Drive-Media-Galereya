@@ -57,7 +57,7 @@ NEXT_PUBLIC_GOOGLE_DRIVE_ROOT_FOLDER_ID=1aBc...xYz`}
               Если Worker уже настроен, достаточно указать его URL:
             </p>
             <pre className="bg-muted p-4 rounded-lg text-sm overflow-x-auto">
-{`NEXT_PUBLIC_WORKER_URL=https://your-worker.workers.dev`}
+{`NEXT_PUBLIC_WORKER_URL=/dmga-api`}
             </pre>
             <p className="text-xs text-muted-foreground mt-2">
               Worker должен иметь эндпоинты: /folders, /files/&#123;id&#125;, /media/&#123;id&#125;, /auth/admin, /auth/keyfile

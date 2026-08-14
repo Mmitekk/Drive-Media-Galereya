@@ -1,0 +1,913 @@
+     1→// ============================================================
+     2→// Cloudflare Worker — Google Drive Media Gallery API Proxy
+     3→// ============================================================
+     4→//
+     5→// Скрывает API-ключ Google Drive на сервере.
+     6→// Проверяет JWT-токены для авторизации.
+     7→// Фильтрует папки по ролям (admin/guest) на сервере.
+     8→// Генерирует и валидирует ключ-файлы на сервере.
+     9→//
+    10→// Секреты (Settings → Variables):
+    11→//   DRIVE_API_KEY          — Google Drive API key
+    12→//   DRIVE_ROOT_FOLDER_ID   — Корневая папка Google Drive
+    13→//   ADMIN_PASSWORD         — Пароль администратора
+    14→//   JWT_SECRET             — Секрет для подписи JWT (случайная строка)
+    15→//   TOKEN_SALT             — Соль для анти-тамперинг токенов
+    16→//
+    17→// ============================================================
+    18→
+    19→export interface Env {
+    20→  DRIVE_API_KEY: string;
+    21→  DRIVE_ROOT_FOLDER_ID: string;
+    22→  ADMIN_PASSWORD: string;
+    23→  JWT_SECRET: string;
+    24→  TOKEN_SALT: string;
+    25→}
+    26→
+    27→// ── CORS ─────────────────────────────────────────────────────
+    28→
+    29→const CORS_HEADERS: Record<string, string> = {
+    30→  "Access-Control-Allow-Origin": "*",
+    31→  "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    32→  "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
+    33→  "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, X-DMGA-Status",
+    34→  "Access-Control-Max-Age": "86400", // Cache preflight for 24h — reduces OPTIONS requests
+    35→};
+    36→
+    37→// ── Helpers ──────────────────────────────────────────────────
+    38→
+    39→function json(data: unknown, status = 200): Response {
+    40→  return new Response(JSON.stringify(data), {
+    41→    status,
+    42→    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    43→  });
+    44→}
+    45→
+    46→function b64url(buf: ArrayBuffer): string {
+    47→  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    48→    .replace(/\+/g, "-")
+    49→    .replace(/\//g, "_")
+    50→    .replace(/=+$/, "");
+    51→}
+    52→
+    53→function b64urlDecode(str: string): string {
+    54→  return atob(str.replace(/-/g, "+").replace(/_/g, "/"));
+    55→}
+    56→
+    57→// ── JWT (HS256) ──────────────────────────────────────────────
+    58→
+    59→async function createJWT(
+    60→  payload: Record<string, unknown>,
+    61→  secret: string
+    62→): Promise<string> {
+    63→  const header = b64url(
+    64→    new TextEncoder().encode(JSON.stringify({ alg: "HS256", typ: "JWT" }))
+    65→  );
+    66→  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));
+    67→  const msg = `${header}.${body}`;
+    68→
+    69→  const key = await crypto.subtle.importKey(
+    70→    "raw",
+    71→    new TextEncoder().encode(secret),
+    72→    { name: "HMAC", hash: "SHA-256" },
+    73→    false,
+    74→    ["sign"]
+    75→  );
+    76→  const sig = b64url(
+    77→    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg))
+    78→  );
+    79→
+    80→  return `${msg}.${sig}`;
+    81→}
+    82→
+    83→async function verifyJWT(
+    84→  token: string,
+    85→  secret: string
+    86→): Promise<Record<string, unknown> | null> {
+    87→  const parts = token.split(".");
+    88→  if (parts.length !== 3) return null;
+    89→
+    90→  const [h, b, s] = parts;
+    91→  const msg = `${h}.${b}`;
+    92→
+    93→  const key = await crypto.subtle.importKey(
+    94→    "raw",
+    95→    new TextEncoder().encode(secret),
+    96→    { name: "HMAC", hash: "SHA-256" },
+    97→    false,
+    98→    ["verify"]
+    99→  );
+   100→
+   101→  const sigStr = b64urlDecode(s);
+   102→  const sigBuf = new Uint8Array(sigStr.length);
+   103→  for (let i = 0; i < sigStr.length; i++) sigBuf[i] = sigStr.charCodeAt(i);
+   104→
+   105→  const valid = await crypto.subtle.verify(
+   106→    "HMAC",
+   107→    key,
+   108→    sigBuf,
+   109→    new TextEncoder().encode(msg)
+   110→  );
+   111→  if (!valid) return null;
+   112→
+   113→  const payload = JSON.parse(b64urlDecode(b));
+   114→  if (payload.exp && payload.exp < Date.now() / 1000) return null;
+   115→
+   116→  return payload;
+   117→}
+   118→
+   119→// ── AES-256-GCM + PBKDF2 (для ключ-файлов) ──────────────────
+   120→// Используем 100_000 итераций (вместо 600_000) для совместимости
+   121→// с лимитом CPU времени Cloudflare Worker (10мс на бесплатном тарифе).
+   122→// 100K итераций — это всё равно ~3 года брутфорса на GPU.
+   123→
+   124→const PBKDF2_ITERATIONS = 100_000;
+   125→const SALT_LENGTH = 16;
+   126→const IV_LENGTH = 12;
+   127→
+   128→async function deriveKey(
+   129→  password: string,
+   130→  salt: Uint8Array
+   131→): Promise<CryptoKey> {
+   132→  const km = await crypto.subtle.importKey(
+   133→    "raw",
+   134→    new TextEncoder().encode(password),
+   135→    "PBKDF2",
+   136→    false,
+   137→    ["deriveKey"]
+   138→  );
+   139→  return crypto.subtle.deriveKey(
+   140→    {
+   141→      name: "PBKDF2",
+   142→      salt,
+   143→      iterations: PBKDF2_ITERATIONS,
+   144→      hash: "SHA-256",
+   145→    },
+   146→    km,
+   147→    { name: "AES-GCM", length: 256 },
+   148→    false,
+   149→    ["encrypt", "decrypt"]
+   150→  );
+   151→}
+   152→
+   153→async function encrypt(
+   154→  data: unknown,
+   155→  password: string
+   156→): Promise<string> {
+   157→  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+   158→  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+   159→  const key = await deriveKey(password, salt);
+   160→  const ct = await crypto.subtle.encrypt(
+   161→    { name: "AES-GCM", iv },
+   162→    key,
+   163→    new TextEncoder().encode(JSON.stringify(data))
+   164→  );
+   165→
+   166→  const combined = new Uint8Array(salt.length + iv.length + ct.byteLength);
+   167→  combined.set(salt, 0);
+   168→  combined.set(iv, salt.length);
+   169→  combined.set(new Uint8Array(ct), salt.length + iv.length);
+   170→
+   171→  return btoa(String.fromCharCode(...combined));
+   172→}
+   173→
+   174→async function decrypt(base64: string, password: string): Promise<unknown> {
+   175→  const combined = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+   176→  if (combined.length < SALT_LENGTH + IV_LENGTH + 1)
+   177→    throw new Error("Повреждённый файл ключа");
+   178→
+   179→  const salt = combined.slice(0, SALT_LENGTH);
+   180→  const iv = combined.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
+   181→  const ct = combined.slice(SALT_LENGTH + IV_LENGTH);
+   182→  const key = await deriveKey(password, salt);
+   183→
+   184→  let pt: ArrayBuffer;
+   185→  try {
+   186→    pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+   187→  } catch {
+   188→    throw new Error("Неверный пароль или повреждённый файл");
+   189→  }
+   190→
+   191→  return JSON.parse(new TextDecoder().decode(pt));
+   192→}
+   193→
+   194→// ── Anti-tampering token ─────────────────────────────────────
+   195→
+   196→async function generateToken(
+   197→  role: string,
+   198→  adminFolders: string[],
+   199→  salt: string
+   200→): Promise<string> {
+   201→  const data = `${role}:${adminFolders.sort().join(",")}:${salt}`;
+   202→  const buf = await crypto.subtle.digest(
+   203→    "SHA-256",
+   204→    new TextEncoder().encode(data)
+   205→  );
+   206→  return Array.from(new Uint8Array(buf))
+   207→    .map((b) => b.toString(16).padStart(2, "0"))
+   208→    .join("");
+   209→}
+   210→
+   211→// ── Google Drive API ─────────────────────────────────────────
+   212→
+   213→async function driveFetch(
+   214→  path: string,
+   215→  params: Record<string, string>,
+   216→  apiKey: string
+   217→): Promise<Record<string, unknown>> {
+   218→  const url = new URL(`https://www.googleapis.com/drive/v3${path}`);
+   219→  url.searchParams.set("key", apiKey);
+   220→  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+   221→
+   222→  const res = await fetch(url.toString());
+   223→  if (!res.ok) {
+   224→    const body = await res.json().catch(() => ({}));
+   225→    throw new Error(
+   226→      (body as Record<string, unknown>)?.error
+   227→        ? String(((body as Record<string, unknown>).error as Record<string, unknown>)?.message || `Drive API error ${res.status}`)
+   228→        : `Drive API error ${res.status}`
+   229→    );
+   230→  }
+   231→  return res.json() as Promise<Record<string, unknown>>;
+   232→}
+   233→
+   234→// ── Auth helper ──────────────────────────────────────────────
+   235→
+   236→async function getAuth(
+   237→  request: Request,
+   238→  env: Env
+   239→): Promise<Record<string, unknown> | null> {
+   240→  const auth = request.headers.get("Authorization");
+   241→  if (!auth?.startsWith("Bearer ")) return null;
+   242→  return verifyJWT(auth.slice(7), env.JWT_SECRET);
+   243→}
+   244→
+   245→// ── Route handlers ───────────────────────────────────────────
+   246→
+   247→async function handleAdminAuth(
+   248→  request: Request,
+   249→  env: Env
+   250→): Promise<Response> {
+   251→  const body = (await request.json()) as { password?: string };
+   252→  const { password } = body;
+   253→
+   254→  if (!password || password !== env.ADMIN_PASSWORD) {
+   255→    return json({ error: "Неверный пароль" }, 401);
+   256→  }
+   257→
+   258→  const now = Math.floor(Date.now() / 1000);
+   259→  const jwt = await createJWT(
+   260→    {
+   261→      role: "admin",
+   262→      adminFolders: [],
+   263→      iat: now,
+   264→      exp: now + 7 * 24 * 3600, // 7 дней
+   265→    },
+   266→    env.JWT_SECRET
+   267→  );
+   268→
+   269→  return json({ token: jwt, role: "admin" });
+   270→}
+   271→
+   272→async function handleGuestAuth(
+   273→  request: Request,
+   274→  env: Env
+   275→): Promise<Response> {
+   276→  const body = (await request.json()) as {
+   277→    keyFile?: string;
+   278→    password?: string;
+   279→  };
+   280→  const { keyFile, password } = body;
+   281→
+   282→  if (!keyFile || !password) {
+   283→    return json({ error: "Не указан ключ-файл или пароль" }, 400);
+   284→  }
+   285→
+   286→  let kf: Record<string, unknown>;
+   287→  try {
+   288→    kf = (await decrypt(keyFile, password)) as Record<string, unknown>;
+   289→  } catch (e) {
+   290→    return json(
+   291→      { error: e instanceof Error ? e.message : "Ошибка расшифровки" },
+   292→      401
+   293→    );
+   294→  }
+   295→
+   296→  if (kf.v !== 4) {
+   297→    return json({ error: "Неподдерживаемая версия ключ-файла" }, 400);
+   298→  }
+   299→
+   300→  // Проверка анти-тамперинг токена (TOKEN_SALT скрыт на сервере!)
+   301→  const expectedToken = await generateToken(
+   302→    String(kf.role),
+   303→    (kf.adminFolders as string[]) || [],
+   304→    env.TOKEN_SALT
+   305→  );
+   306→  if (kf.token !== expectedToken) {
+   307→    return json({ error: "Ключ-файл повреждён или был изменён" }, 401);
+   308→  }
+   309→
+   310→  if (kf.role !== "guest") {
+   311→    return json({ error: "Это не гостевой ключ-файл" }, 400);
+   312→  }
+   313→
+   314→  const now = Math.floor(Date.now() / 1000);
+   315→  const adminFolders = (kf.adminFolders as string[]) || [];
+   316→  const jwt = await createJWT(
+   317→    {
+   318→      role: "guest",
+   319→      adminFolders,
+   320→      iat: now,
+   321→      exp: now + 30 * 24 * 3600, // 30 дней
+   322→    },
+   323→    env.JWT_SECRET
+   324→  );
+   325→
+   326→  return json({ token: jwt, role: "guest", adminFolders });
+   327→}
+   328→
+   329→async function handleKeyFileGenerate(
+   330→  request: Request,
+   331→  env: Env
+   332→): Promise<Response> {
+   333→  const auth = await getAuth(request, env);
+   334→  if (!auth || auth.role !== "admin") {
+   335→    return json({ error: "Требуется авторизация администратора" }, 403);
+   336→  }
+   337→
+   338→  const body = (await request.json()) as {
+   339→    password?: string;
+   340→    adminFolders?: string[];
+   341→  };
+   342→  const { password, adminFolders } = body;
+   343→
+   344→  if (!password || password.length < 4) {
+   345→    return json(
+   346→      { error: "Пароль должен быть не менее 4 символов" },
+   347→      400
+   348→    );
+   349→  }
+   350→
+   351→  // Генерация анти-тамперинг токена (TOKEN_SALT скрыт на сервере!)
+   352→  const token = await generateToken(
+   353→    "guest",
+   354→    adminFolders || [],
+   355→    env.TOKEN_SALT
+   356→  );
+   357→
+   358→  const keyFileData = {
+   359→    v: 4,
+   360→    role: "guest",
+   361→    adminFolders: adminFolders || [],
+   362→    token,
+   363→  };
+   364→
+   365→  // Шифрование ключ-файла на сервере
+   366→  const encrypted = await encrypt(keyFileData, password);
+   367→
+   368→  return json({ keyFile: encrypted });
+   369→}
+   370→
+   371→async function handleFolders(
+   372→  request: Request,
+   373→  env: Env
+   374→): Promise<Response> {
+   375→  const auth = await getAuth(request, env);
+   376→  if (!auth) {
+   377→    return json({ error: "Требуется авторизация" }, 401);
+   378→  }
+   379→
+   380→  // ── BFS: recursively discover ALL subfolders (not just top-level) ──
+   381→  // The old code only fetched direct children of the root folder.
+   382→  // This missed nested subfolders like "Видео / Как Шерон Стоун / Красотка в белом".
+   383→  // Now we walk the entire folder tree level by level.
+   384→  // OPTIMIZATION: chunks within each level are fetched IN PARALLEL (Promise.all)
+   385→  //   instead of sequentially — reduces wall time from ~20s to ~3-5s.
+   386→  // SAFETY: stops after MAX_DEPTH levels, MAX_FOLDERS folders, or WALL_TIME_MS.
+   387→  // RESILIENCE: each chunk is wrapped in try/catch — one Drive API error
+   388→  //   doesn't kill the entire response; we return whatever we found so far.
+   389→  const allFolders: Record<string, unknown>[] = [];
+   390→  let currentLevel = [env.DRIVE_ROOT_FOLDER_ID];
+   391→  const visited = new Set<string>([env.DRIVE_ROOT_FOLDER_ID]);
+   392→  const MAX_DEPTH = 10;      // Don't go deeper than 10 levels
+   393→  const MAX_FOLDERS = 500;   // Don't discover more than 500 folders
+   394→  const CHUNK_SIZE = 25;     // Max parent IDs per Drive API query (avoid URL length limits)
+   395→  const MAX_SUBREQUESTS = 45; // Cloudflare limit is 50; reserve 5 for safety
+   396→  const WALL_TIME_MS = 12_000; // Stop BFS after 12s — leave room for JSON serialization & network
+   397→  const startTime = Date.now();
+   398→  let totalSubrequests = 0;
+   399→  let chunkErrors = 0;
+   400→
+   401→  for (let depth = 0; depth < MAX_DEPTH && currentLevel.length > 0 && allFolders.length < MAX_FOLDERS; depth++) {
+   402→    // Check wall-clock time before each level
+   403→    if (Date.now() - startTime > WALL_TIME_MS) {
+   404→      console.log(`[DMGA] BFS timeout after ${depth} levels, ${allFolders.length} folders, ${Date.now() - startTime}ms`);
+   405→      break;
+   406→    }
+   407→    // Check subrequest limit
+   408→    if (totalSubrequests >= MAX_SUBREQUESTS) {
+   409→      console.log(`[DMGA] BFS subrequest limit reached at depth ${depth}, ${allFolders.length} folders`);
+   410→      break;
+   411→    }
+   412→
+   413→    // Build all chunk queries for this level
+   414→    const chunks: string[][] = [];
+   415→    for (let i = 0; i < currentLevel.length; i += CHUNK_SIZE) {
+   416→      chunks.push(currentLevel.slice(i, i + CHUNK_SIZE));
+   417→    }
+   418→
+   419→    // Check if we'd exceed subrequest limit
+   420→    if (totalSubrequests + chunks.length > MAX_SUBREQUESTS) {
+   421→      // Trim to fit
+   422→      chunks.length = MAX_SUBREQUESTS - totalSubrequests;
+   423→    }
+   424→    totalSubrequests += chunks.length;
+   425→
+   426→    // Execute all chunks IN PARALLEL within this level
+   427→    const results = await Promise.allSettled(
+   428→      chunks.map(async (chunk) => {
+   429→        const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+   430→        const query = `(${parentQueries}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+   431→
+   432→        const data = await driveFetch(
+   433→          "/files",
+   434→          {
+   435→            q: query,
+   436→            fields: "files(id, name, createdTime, parents)",
+   437→            pageSize: "500",
+   438→            orderBy: "name",
+   439→            supportsAllDrives: "true",
+   440→            includeItemsFromAllDrives: "true",
+   441→          },
+   442→          env.DRIVE_API_KEY
+   443→        );
+   444→
+   445→        return (data.files as Record<string, unknown>[]) || [];
+   446→      })
+   447→    );
+   448→
+   449→    const nextLevel: string[] = [];
+   450→    for (const result of results) {
+   451→      if (result.status === "fulfilled") {
+   452→        for (const folder of result.value) {
+   453→          const id = folder.id as string;
+   454→          if (!visited.has(id)) {
+   455→            visited.add(id);
+   456→            allFolders.push(folder);
+   457→            nextLevel.push(id);
+   458→          }
+   459→        }
+   460→      } else {
+   461→        chunkErrors++;
+   462→        console.error(`[DMGA] BFS chunk error at depth ${depth}: ${result.reason}`);
+   463→      }
+   464→    }
+   465→
+   466→    currentLevel = nextLevel;
+   467→  }
+   468→
+   469→  console.log(`[DMGA] BFS done: ${allFolders.length} folders in ${Date.now() - startTime}ms, ${totalSubrequests} subrequests, ${chunkErrors} chunk errors`);
+   470→
+   471→  let folders = allFolders;
+   472→
+   473→  // Фильтрация папок на сервере! Гость не видит admin-папки.
+   474→  if (auth.role === "guest" && (auth.adminFolders as string[])?.length > 0) {
+   475→    const adminFolders = auth.adminFolders as string[];
+   476→    folders = folders.filter((f) => !adminFolders.includes(f.id as string));
+   477→  }
+   478→
+   479→  return json({ folders });
+   480→}
+   481→
+   482→async function handleFiles(
+   483→  request: Request,
+   484→  env: Env,
+   485→  folderId: string
+   486→): Promise<Response> {
+   487→  const auth = await getAuth(request, env);
+   488→  if (!auth) {
+   489→    return json({ error: "Требуется авторизация" }, 401);
+   490→  }
+   491→
+   492→  // Проверка доступа к папке на сервере!
+   493→  if (
+   494→    auth.role === "guest" &&
+   495→    (auth.adminFolders as string[])?.includes(folderId)
+   496→  ) {
+   497→    return json({ error: "Доступ запрещён" }, 403);
+   498→  }
+   499→
+   500→  const data = await driveFetch(
+   501→    "/files",
+   502→    {
+   503→      q: `'${folderId}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`,
+   504→      fields:
+   505→        "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+   506→      pageSize: "200",
+   507→      orderBy: "createdTime desc",
+   508→      supportsAllDrives: "true",
+   509→      includeItemsFromAllDrives: "true",
+   510→    },
+   511→    env.DRIVE_API_KEY
+   512→  );
+   513→
+   514→  return json({ files: data.files || [] });
+   515→}
+   516→
+   517→async function handleBatchFiles(
+   518→  request: Request,
+   519→  env: Env
+   520→): Promise<Response> {
+   521→  const auth = await getAuth(request, env);
+   522→  if (!auth) {
+   523→    return json({ error: "Требуется авторизация" }, 401);
+   524→  }
+   525→
+   526→  // Parse folder IDs from query params: ?ids=id1,id2,id3
+   527→  const url = new URL(request.url);
+   528→  const idsParam = url.searchParams.get("ids");
+   529→  if (!idsParam) {
+   530→    return json({ error: "Не указаны ID папок (параметр ids)" }, 400);
+   531→  }
+   532→
+   533→  const folderIds = idsParam.split(",").filter(Boolean);
+   534→  if (folderIds.length === 0) {
+   535→    return json({ error: "Пустой список ID папок" }, 400);
+   536→  }
+   537→
+   538→  // Filter out admin-only folders for guest users
+   539→  const adminFolders = (auth.adminFolders as string[]) || [];
+   540→  const allowedFolderIds = auth.role === "guest" && adminFolders.length > 0
+   541→    ? folderIds.filter((id) => !adminFolders.includes(id))
+   542→    : folderIds;
+   543→
+   544→  if (allowedFolderIds.length === 0) {
+   545→    return json({ files: {} });
+   546→  }
+   547→
+   548→  // ── Chunked batch: split folder IDs into chunks to avoid Drive API query length limits ──
+   549→  // With nested subfolders, the list of IDs can be very long (50+).
+   550→  // Each `'ID' in parents` clause is ~35 chars, so ~25 IDs per query is safe.
+   551→  // OPTIMIZATION: all chunks are fetched IN PARALLEL (Promise.allSettled)
+   552→  //   instead of sequentially — much faster for large folder lists.
+   553→  // RESILIENCE: one chunk error doesn't kill the entire response.
+   554→  const BATCH_CHUNK_SIZE = 25;
+   555→  const allowedSet = new Set(allowedFolderIds);
+   556→  const filesByFolder: Record<string, Record<string, unknown>[]> = {};
+   557→
+   558→  // Build chunks
+   559→  const chunks: string[][] = [];
+   560→  for (let i = 0; i < allowedFolderIds.length; i += BATCH_CHUNK_SIZE) {
+   561→    chunks.push(allowedFolderIds.slice(i, i + BATCH_CHUNK_SIZE));
+   562→  }
+   563→
+   564→  // Execute all chunks IN PARALLEL
+   565→  const results = await Promise.allSettled(
+   566→    chunks.map(async (chunk) => {
+   567→      const parentQueries = chunk.map((id) => `'${id}' in parents`).join(" or ");
+   568→      const query = `(${parentQueries}) and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`;
+   569→
+   570→      const data = await driveFetch(
+   571→        "/files",
+   572→        {
+   573→          q: query,
+   574→          fields:
+   575→            "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+   576→          pageSize: "1000",
+   577→          orderBy: "createdTime desc",
+   578→          supportsAllDrives: "true",
+   579→          includeItemsFromAllDrives: "true",
+   580→        },
+   581→        env.DRIVE_API_KEY
+   582→      );
+   583→
+   584→      return (data.files as Record<string, unknown>[]) || [];
+   585→    })
+   586→  );
+   587→
+   588→  // Group files by parent folder from all successful chunk results
+   589→  for (const result of results) {
+   590→    if (result.status === "fulfilled") {
+   591→      for (const file of result.value) {
+   592→        const parents = (file.parents as string[]) || [];
+   593→        for (const parentId of parents) {
+   594→          if (allowedSet.has(parentId)) {
+   595→            if (!filesByFolder[parentId]) filesByFolder[parentId] = [];
+   596→            filesByFolder[parentId].push(file);
+   597→          }
+   598→        }
+   599→      }
+   600→    } else {
+   601→      console.error(`[DMGA] Batch files chunk error: ${result.reason}`);
+   602→    }
+   603→  }
+   604→
+   605→  // Ensure all requested folders have an entry (even empty ones)
+   606→  for (const folderId of allowedFolderIds) {
+   607→    if (!filesByFolder[folderId]) {
+   608→      filesByFolder[folderId] = [];
+   609→    }
+   610→  }
+   611→
+   612→  return json({ files: filesByFolder });
+   613→}
+   614→
+   615→async function handleRootFiles(
+   616→  request: Request,
+   617→  env: Env
+   618→): Promise<Response> {
+   619→  const auth = await getAuth(request, env);
+   620→  if (!auth) {
+   621→    return json({ error: "Требуется авторизация" }, 401);
+   622→  }
+   623→
+   624→  const data = await driveFetch(
+   625→    "/files",
+   626→    {
+   627→      q: `'${env.DRIVE_ROOT_FOLDER_ID}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`,
+   628→      fields:
+   629→        "files(id, name, mimeType, createdTime, modifiedTime, parents, size, webViewLink, webContentLink, thumbnailLink, imageMediaMetadata, videoMediaMetadata)",
+   630→      pageSize: "200",
+   631→      orderBy: "createdTime desc",
+   632→      supportsAllDrives: "true",
+   633→      includeItemsFromAllDrives: "true",
+   634→    },
+   635→    env.DRIVE_API_KEY
+   636→  );
+   637→
+   638→  return json({ files: data.files || [] });
+   639→}
+   640→
+   641→// ── Media proxy — streams files from Google Drive ──────────
+   642→
+   643→async function handleMedia(
+   644→  request: Request,
+   645→  env: Env,
+   646→  fileId: string
+   647→): Promise<Response> {
+   648→  // Auth: check token from query param or Authorization header
+   649→  let token: string | null = null;
+   650→  const url = new URL(request.url);
+   651→  if (url.searchParams.has("token")) {
+   652→    token = url.searchParams.get("token");
+   653→  } else {
+   654→    const auth = await getAuth(request, env);
+   655→    if (!auth) {
+   656→      return json({ error: "Требуется авторизация" }, 401);
+   657→    }
+   658→    token = request.headers.get("Authorization")?.slice(7) || null;
+   659→  }
+   660→
+   661→  if (!token) {
+   662→    return json({ error: "Требуется авторизация" }, 401);
+   663→  }
+   664→
+   665→  // Verify JWT
+   666→  const payload = await verifyJWT(token, env.JWT_SECRET);
+   667→  if (!payload) {
+   668→    return json({ error: "Недействительный токен" }, 401);
+   669→  }
+   670→
+   671→  // ── HEAD request: probe if file is accessible ──
+   672→  // The client sends a HEAD request to check if the video URL works
+   673→  // before setting it as <video src>. This prevents the native
+   674→  // browser error overlay from appearing.
+   675→  if (request.method === "HEAD") {
+   676→    const probeUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+   677→    try {
+   678→      const probeRes = await fetch(probeUrl, {
+   679→        headers: { "Range": "bytes=0-1" },
+   680→      });
+   681→      if (probeRes.ok || probeRes.status === 206) {
+   682→        const contentType = probeRes.headers.get("Content-Type") || "application/octet-stream";
+   683→        const contentLength = probeRes.headers.get("Content-Range")?.split("/")?.[1] || probeRes.headers.get("Content-Length") || "0";
+   684→        return new Response(null, {
+   685→          status: 200,
+   686→          headers: {
+   687→            ...CORS_HEADERS,
+   688→            "Content-Type": contentType,
+   689→            "Content-Length": contentLength,
+   690→            "Accept-Ranges": "bytes",
+   691→            "Cache-Control": "no-cache",
+   692→            "X-DMGA-Status": "accessible",
+   693→          },
+   694→        });
+   695→      } else {
+   696→        let errorMsg = `Drive API error ${probeRes.status}`;
+   697→        try {
+   698→          const errBody = await probeRes.json();
+   699→          errorMsg = (errBody as Record<string, unknown>)?.error
+   700→            ? String(((errBody as Record<string, unknown>).error as Record<string, unknown>)?.message || errorMsg)
+   701→            : errorMsg;
+   702→        } catch {}
+   703→        return json({ error: errorMsg }, probeRes.status as 400 | 401 | 403 | 404 | 500);
+   704→      }
+   705→    } catch (err) {
+   706→      return json({ error: `Network error: ${err instanceof Error ? err.message : "unknown"}` }, 502);
+   707→    }
+   708→  }
+   709→
+   710→  // ── GET request: stream the file from Google Drive ──
+   711→  // Forward Range header for video seeking support
+   712→  const driveHeaders: Record<string, string> = {};
+   713→  const rangeHeader = request.headers.get("Range");
+   714→  if (rangeHeader) {
+   715→    driveHeaders["Range"] = rangeHeader;
+   716→  }
+   717→
+   718→  const driveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${env.DRIVE_API_KEY}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+   719→
+   720→  const driveRes = await fetch(driveUrl, { headers: driveHeaders });
+   721→  if (!driveRes.ok) {
+   722→    const body = await driveRes.text().catch(() => "");
+   723→    return json(
+   724→      { error: `Не удалось получить файл: ${driveRes.status}` },
+   725→      driveRes.status as 400 | 401 | 403 | 404 | 500
+   726→    );
+   727→  }
+   728→
+   729→  // Stream response with CORS headers
+   730→  const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
+   731→  const contentLength = driveRes.headers.get("Content-Length");
+   732→  const contentRange = driveRes.headers.get("Content-Range");
+   733→  const acceptRanges = driveRes.headers.get("Accept-Ranges");
+   734→  const headers: Record<string, string> = {
+   735→    ...CORS_HEADERS,
+   736→    "Content-Type": contentType,
+   737→    "Cache-Control": "public, max-age=3600", // 1h cache
+   738→    "Accept-Ranges": acceptRanges || "bytes",
+   739→  };
+   740→  if (contentLength) headers["Content-Length"] = contentLength;
+   741→  if (contentRange) headers["Content-Range"] = contentRange;
+   742→
+   743→  // 206 Partial Content for range requests
+   744→  const isPartial = driveRes.status === 206;
+   745→  return new Response(driveRes.body, {
+   746→    status: isPartial ? 206 : 200,
+   747→    headers,
+   748→  });
+   749→}
+   750→
+   751→// ── Thumbnail proxy — returns thumbnail image from Google Drive ──
+   752→// Used as fallback when thumbnailLink is not available.
+   753→// Supports ?token= query param for auth and ?sz= for size.
+   754→
+   755→async function handleThumbnail(
+   756→  request: Request,
+   757→  env: Env,
+   758→  fileId: string
+   759→): Promise<Response> {
+   760→  // Auth: check token from query param or Authorization header
+   761→  let token: string | null = null;
+   762→  const url = new URL(request.url);
+   763→  if (url.searchParams.has("token")) {
+   764→    token = url.searchParams.get("token");
+   765→  } else {
+   766→    const auth = await getAuth(request, env);
+   767→    if (!auth) {
+   768→      return json({ error: "Требуется авторизация" }, 401);
+   769→    }
+   770→    token = request.headers.get("Authorization")?.slice(7) || null;
+   771→  }
+   772→
+   773→  if (!token) {
+   774→    return json({ error: "Требуется авторизация" }, 401);
+   775→  }
+   776→
+   777→  // Verify JWT
+   778→  const payload = await verifyJWT(token, env.JWT_SECRET);
+   779→  if (!payload) {
+   780→    return json({ error: "Недействительный токен" }, 401);
+   781→  }
+   782→
+   783→  // Get thumbnail size from query param (default w400)
+   784→  const sizeParam = url.searchParams.get("sz") || "w400";
+   785→  const size = parseInt(sizeParam.replace("w", ""), 10) || 400;
+   786→
+   787→  // First, try to get the thumbnailLink from the Drive API
+   788→  try {
+   789→    const fileData = await driveFetch(
+   790→      `/files/${fileId}`,
+   791→      {
+   792→        fields: "thumbnailLink,mimeType",
+   793→        supportsAllDrives: "true",
+   794→        includeItemsFromAllDrives: "true",
+   795→      },
+   796→      env.DRIVE_API_KEY
+   797→    );
+   798→
+   799→    const thumbnailLink = fileData.thumbnailLink as string | undefined;
+   800→    if (thumbnailLink) {
+   801→      // Replace the size suffix in the thumbnail URL
+   802→      const sizedUrl = thumbnailLink.replace(/=s\d+$/, `=s${size}`);
+   803→      const thumbRes = await fetch(sizedUrl);
+   804→      if (thumbRes.ok) {
+   805→        const contentType = thumbRes.headers.get("Content-Type") || "image/jpeg";
+   806→        const body = await thumbRes.arrayBuffer();
+   807→        return new Response(body, {
+   808→          status: 200,
+   809→          headers: {
+   810→            ...CORS_HEADERS,
+   811→            "Content-Type": contentType,
+   812→            "Cache-Control": "public, max-age=3600",
+   813→            "Access-Control-Allow-Origin": "*",
+   814→          },
+   815→        });
+   816→      }
+   817→    }
+   818→  } catch {
+   819→    // thumbnailLink approach failed, try direct thumbnail
+   820→  }
+   821→
+   822→  // Fallback: use drive.google.com/thumbnail
+   823→  const thumbUrl = `https://drive.google.com/thumbnail?id=${fileId}&sz=w${size}`;
+   824→  try {
+   825→    const thumbRes = await fetch(thumbUrl, {
+   826→      headers: { "Authorization": `Bearer ${env.DRIVE_API_KEY}` },
+   827→    });
+   828→    if (thumbRes.ok) {
+   829→      const contentType = thumbRes.headers.get("Content-Type") || "image/jpeg";
+   830→      const body = await thumbRes.arrayBuffer();
+   831→      return new Response(body, {
+   832→        status: 200,
+   833→        headers: {
+   834→          ...CORS_HEADERS,
+   835→          "Content-Type": contentType,
+   836→          "Cache-Control": "public, max-age=3600",
+   837→        },
+   838→      });
+   839→    }
+   840→  } catch {
+   841→    // All thumbnail methods failed
+   842→  }
+   843→
+   844→  return json({ error: "Не удалось получить миниатюру" }, 404);
+   845→}
+   846→
+   847→// ── Main handler ─────────────────────────────────────────────
+   848→
+   849→export default {
+   850→  async fetch(request: Request, env: Env): Promise<Response> {
+   851→    // CORS preflight
+   852→    if (request.method === "OPTIONS") {
+   853→      return new Response(null, { headers: CORS_HEADERS });
+   854→    }
+   855→
+   856→    const url = new URL(request.url);
+   857→
+   858→    try {
+   859→      // Авторизация
+   860→      if (url.pathname === "/auth/admin" && request.method === "POST") {
+   861→        return handleAdminAuth(request, env);
+   862→      }
+   863→      if (url.pathname === "/auth/guest" && request.method === "POST") {
+   864→        return handleGuestAuth(request, env);
+   865→      }
+   866→
+   867→      // Генерация ключ-файлов (только для админа)
+   868→      if (url.pathname === "/keyfile/generate" && request.method === "POST") {
+   869→        return handleKeyFileGenerate(request, env);
+   870→      }
+   871→
+   872→      // Данные — требуют авторизацию
+   873→      if (url.pathname === "/folders" && request.method === "GET") {
+   874→        return handleFolders(request, env);
+   875→      }
+   876→      if (url.pathname === "/files/root" && request.method === "GET") {
+   877→        return handleRootFiles(request, env);
+   878→      }
+   879→      if (url.pathname === "/files/batch" && request.method === "GET") {
+   880→        return handleBatchFiles(request, env);
+   881→      }
+   882→      if (url.pathname.startsWith("/files/") && request.method === "GET") {
+   883→        const folderId = url.pathname.slice(7);
+   884→        return handleFiles(request, env, folderId);
+   885→      }
+   886→
+   887→      // Миниатюры — проксирует thumbnails из Google Drive
+   888→      if (url.pathname.startsWith("/thumbnail/") && request.method === "GET") {
+   889→        const fileId = url.pathname.slice(11);
+   890→        return handleThumbnail(request, env, fileId);
+   891→      }
+   892→
+   893→      // Медиа-прокси — стримит файлы Google Drive через Worker
+   894→      // Используется для видео и полноразмерных изображений
+   895→      // Поддерживает GET (стриминг) и HEAD (проверка доступности)
+   896→      if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
+   897→        const fileId = url.pathname.slice(7);
+   898→        return handleMedia(request, env, fileId);
+   899→      }
+   900→
+   901→      // Health check
+   902→      if (url.pathname === "/") {
+   903→        return json({ status: "ok", service: "DMGA API Proxy" });
+   904→      }
+   905→
+   906→      return json({ error: "Not found" }, 404);
+   907→    } catch (err: unknown) {
+   908→      const message = err instanceof Error ? err.message : "Internal server error";
+   909→      return json({ error: message }, 500);
+   910→    }
+   911→  },
+   912→};
+   913→

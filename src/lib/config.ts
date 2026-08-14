@@ -8,7 +8,7 @@
 
 // HARDCODED FALLBACK: even if .env gets wiped, the Worker URL
 // is baked into the build so the SetupGuide screen NEVER appears.
-const FALLBACK_WORKER_URL = "https://dmga-api.galinakostrik2023.workers.dev";
+const FALLBACK_WORKER_URL = "/dmga-api";
 
 export const CONFIG = {
   // Google Drive API key (for direct client-side access)

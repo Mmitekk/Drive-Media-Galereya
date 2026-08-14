@@ -1,4 +1,12 @@
 :81 {
+	# ── API proxy: bypass workers.dev blocking in Russia ──
+	# /dmga-api/* → standalone proxy on port 3001 → Cloudflare Worker
+	# The browser never contacts workers.dev directly.
+	handle /dmga-api/* {
+		uri strip_prefix /dmga-api
+		reverse_proxy localhost:3001
+	}
+
 	@transform_port_query {
 		query XTransformPort=*
 	}
