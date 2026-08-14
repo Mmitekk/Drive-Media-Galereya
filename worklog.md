@@ -21,3 +21,24 @@ Stage Summary:
 - Browser → Caddy:81/dmga-api/* → proxy:3001 → Worker (workers.dev)
 - All code changes committed, build successful
 - Deployment requires: updated Caddyfile + proxy-server.js running
+
+---
+Task ID: 2
+Agent: main
+Task: Implement IP-based proxy and fix process stability
+
+Work Log:
+- Tested direct IP access to Cloudflare Worker (104.21.86.95, 172.67.217.106) — works with proper SNI
+- Simplified proxy-server.js to use standard https.request instead of custom lookup (was causing crashes)
+- Verified proxy stability: handles sequential requests correctly
+- Created mini-services/dmga-proxy/ for auto-start on container boot
+- Created .zscripts/dev.sh to start both proxy and Next.js dev server
+- Updated Caddyfile with /dmga-api/* → proxy:3001 route
+- Verified build output: 0 references to workers.dev, /dmga-api present in 2 chunks
+
+Stage Summary:
+- Proxy works: POST /auth/admin → {"error":"Неверный пароль"} (401) ✓
+- Proxy works: GET / → {"status":"ok"} (200) ✓
+- Proxy works: OPTIONS → 204 with CORS ✓
+- Cannot modify /app/Caddyfile directly (root:root 0600)
+- Deployment needs: Caddyfile update + proxy process start
